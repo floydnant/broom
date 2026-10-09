@@ -1,0 +1,36 @@
+version = 1
+
+# Never prune dependencies anywhere under these paths.
+exclude = []
+# Example: exclude = ["~/projects/always-keep"]
+
+[[directories]]
+path = "~/projects"
+# Optional per-directory overrides:
+# worktree_days = 10
+# project_days = 28
+
+[[directories]]
+path = "~/.t3/worktrees"
+worktree_days = 3
+
+[[directories]]
+path = "~/.codex/worktrees"
+worktree_days = 3
+
+[policies.worktrees]
+enabled = true
+idle_days = 7
+
+[policies.projects]
+enabled = true
+idle_days = 21
+
+[schedule]
+enabled = false
+time = "12:00"
+# Empty means daily. Example: ["mon", "wed", "fri"]
+weekdays = []
+# Use "preview" to log candidates without deleting dependencies.
+# mode = "apply"
+mode = "preview"
