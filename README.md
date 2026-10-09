@@ -1,5 +1,5 @@
 If you are like me, you have a million project folders with another million linked worktrees, each with their own `node_modules`.
-This can quickly get out of hand and in my case take up almost a 1/5 of my entire disk space.
+This can quickly get out of hand and in my case take up almost a 1/10 of my entire disk space.
 
 Normal disk space cleaners wont catch this, as its "important user data".
 Even amazing apps like [harry0703/MangoDisk](https://github.com/harry0703/MangoDisk)
