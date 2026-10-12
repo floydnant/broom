@@ -9,7 +9,7 @@ that let you configure custom clean ups cant let you express the type of "stale 
 
 Broom to the rescue!
 
-Prune `node_modules` from idle projects and linked Git worktrees. The defaults retain dependencies for seven days in worktrees and 21 days in regular projects. Source files, Git metadata, and lockfiles stay in place.
+Prune dependencies and generated build output from idle projects and linked Git worktrees. The defaults retain dependencies for seven days in worktrees and 21 days in regular projects. Source files, Git metadata, and lockfiles stay in place.
 
 Requires Python 3.11 or newer, Git, and `lsof`. No packages to install. The scheduler requires macOS. The cleaner uses Unix filesystem metadata and `lsof`.
 
@@ -23,7 +23,7 @@ python3 cleanup.py
 python3 cleanup.py --apply
 ```
 
-The first command previews candidates. The second deletes their dependency directories. Reinstall dependencies with the project's normal package manager when you return to a cleaned project.
+The first command previews candidates. The second deletes their selected artifact directories. Reinstall dependencies with the project's normal package manager when you return to a cleaned project.
 
 Each run ends with estimated freeable space and the number of eligible projects. An apply run also reports estimated space removed by completed cleanups and the observed change in available disk space during cleanup. Failed cleanups do not count toward the removed-space estimate. Shared files and other apps writing to the disk can make the observed change differ from the estimate. JSON output includes these byte counts under `summary`.
 
@@ -40,9 +40,10 @@ The config controls:
 | `exclude` at the top of the file | Paths whose dependencies must stay, including everything beneath them |
 | `[policies.worktrees]` | `enabled` and `idle_days` for linked Git worktrees, default seven days |
 | `[policies.projects]` | `enabled` and `idle_days` for regular projects, default 21 days |
+| `[artifacts]` | Enable known cleanup categories, all new categories are opt-in |
 | `[schedule]` | `enabled`, local `time`, `weekdays`, and `mode` |
 
-The example scan directories are `~/projects`, `~/.t3/worktrees`, and `~/.codex/worktrees`. Change them to match your setup. Regular projects include main Git checkouts, Git submodules, and standalone folders containing `package.json`. Workspace packages belong to their containing project. Nested Git repositories have their own policy and activity checks.
+The example scan directories are `~/projects`, `~/.t3/worktrees`, and `~/.codex/worktrees`. Change them to match your setup. Regular projects include main Git checkouts, Git submodules, and standalone Node, Cargo, Gradle, Flutter, Xcode, .NET, SwiftPM, or CMake projects recognized by their manifests. Workspace packages belong to their containing project. Nested Git repositories have their own policy and activity checks.
 
 For example, keep dependencies under one project and give another scan directory longer retention:
 
@@ -67,6 +68,58 @@ python3 cleanup.py --json > report.json
 ```
 
 Repeated `--root` arguments replace configured scan directories for that run. `--days` overrides both retention policies and any directory retention overrides. Policy enable switches and exclusions still apply. JSON reports use `projects` for both project kinds, with a `kind` and `idle_days` field on each row.
+
+## Choose artifact types
+
+Only `node_modules` is enabled by default. Existing configs without an `[artifacts]` table keep that behavior. Enable additional categories in your local `broom.toml`:
+
+```toml
+[artifacts]
+node_modules = true
+rust = true
+flutter = true
+gradle = true
+ios_build = true
+cocoapods = false
+web = true
+dotnet = false
+swift = false
+cmake = false
+```
+
+Each category inherits the existing project and worktree idle policies, including directory overrides. A recent source edit or build protects the entire project. Retention and artifact selection changes take effect on the next scheduled run without reinstalling the job.
+
+| Category | Selected directories and required evidence | Recreate with |
+| --- | --- | --- |
+| `node_modules` | Dependency installations inside recognized projects | Your package manager's install command |
+| `rust` | `target` beside `Cargo.toml`, including Tauri projects | `cargo build` or the project's Tauri build command |
+| `flutter` | `build` beside a Flutter manifest and `.dart_tool` beside `pubspec.yaml` | `flutter pub get`, then the usual Flutter build command |
+| `gradle` | `build`, `.gradle`, and `.cxx` beside Gradle settings or a build script, including Android modules | The project's Gradle build command |
+| `ios_build` | Local `build` and `DerivedData` beside a Podfile or Xcode project | The normal Xcode or native app build command |
+| `cocoapods` | `Pods` beside both `Podfile` and `Podfile.lock` | `pod install` |
+| `web` | Next.js `.next`, Nuxt `.nuxt` and `.output`, Turbo `.turbo`, Expo `.expo`, Parcel `.parcel-cache`, Angular `.angular/cache`, and qualifying `dist` output | The framework's normal dev or build command |
+| `dotnet` | `bin` and `obj` beside a `.csproj`, `.fsproj`, or `.vbproj` | `dotnet build` |
+| `swift` | `.build` beside `Package.swift` | `swift build` |
+| `cmake` | `build` beside `CMakeLists.txt`, containing `CMakeCache.txt` | Reconfigure and rebuild with CMake |
+
+Framework caches require the corresponding package dependency or config file. Generic `dist` requires an adjacent package manifest with a recognized build command and an explicit Git ignore match. A directory name alone does not qualify.
+
+Broom keeps any artifact containing a file tracked in the owning repository. It rechecks tracked files and the selected artifact paths before deletion. Excluding a path inside an artifact protects that entire artifact. Symlinked roots stay untouched. Nested output trees count once, so `.next/standalone/node_modules` belongs to the `.next` artifact rather than a second cleanup selection. Disabled artifact trees retain their nested dependencies too. Their timestamps still count as project activity.
+
+The rules select project-local artifacts. Global Xcode DerivedData, Xcode archives, simulator data, SDKs, global Gradle caches, Cargo registries, source directories, native `ios` and `android` project folders, signing files, and lockfiles remain outside these rules. Custom output paths are not automatically inferred.
+
+Preview one category without changing your config:
+
+```sh
+python3 cleanup.py --artifact rust
+python3 cleanup.py --artifact flutter --artifact gradle --artifact cocoapods
+```
+
+Repeated `--artifact` options replace the config's category selection for that run. Add `--artifact node_modules` to include dependencies too. Manual runs remain previews unless you pass `--apply`.
+
+Reports include an `artifacts` list with each directory's type and size, `protected_artifacts` explaining exclusions or tracked files, and per-category totals under `summary.by_artifact`. The legacy `node_modules` list contains only selected dependency installations. Project totals and observed free-space changes include all selected categories.
+
+These boundaries follow the documented artifact layouts for [Cargo](https://doc.rust-lang.org/cargo/reference/build-cache.html), [Gradle](https://docs.gradle.org/current/userguide/directory_layout.html), [Android native staging](https://developer.android.google.cn/reference/tools/gradle-api/7.2/com/android/build/api/dsl/NdkBuild), [Flutter clean](https://github.com/flutter/website/blob/main/sites/docs/src/content/reference/flutter-cli.md), [Xcode build settings](https://developer.apple.com/library/archive/documentation/DeveloperTools/Reference/XcodeBuildSettingRef/1-Build_Setting_Reference/build_setting_ref.html), [CocoaPods](https://guides.cocoapods.org/using/using-cocoapods), [Next.js](https://nextjs.org/docs/pages/api-reference/config/next-config-js/distDir), [Nuxt](https://nuxt.com/docs/4.x/directory-structure/gitignore), [Expo](https://github.com/expo/expo/blob/main/docs/pages/more/expo-cli.mdx), [.NET](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-clean), [SwiftPM](https://docs.swift.org/latest/documentation/swiftlinux/building/), and [CMake](https://cmake.org/cmake/help/book/mastering-cmake/chapter/CMake%20Cache.html).
 
 ## Schedule it
 
@@ -100,11 +153,11 @@ The cleaner checks modification times across source files, untracked files, depe
 
 It also skips projects with files or working directories open in a current-user process, then repeats the activity check before deletion. Opening or reading a file does not reliably change its modification time. To extend retention, run `touch /path/to/project/.keep-dependencies`. A future modification time also keeps the project.
 
-It verifies Git project roots and linked worktree registration, skips symlinked dependency directories, and does not follow symlinks. An unreadable path or failed activity check skips cleanup for that project. An unavailable process check stops the run. Simultaneous runs share a lock.
+It verifies Git project roots and linked worktree registration, protects tracked artifacts, skips symlinked artifact directories, and does not follow symlinks. An unreadable path or failed activity check skips cleanup for that project. An unavailable process check stops the run. Simultaneous runs share a lock.
 
-Deletion renames each dependency directory before removing it. It cannot eliminate races with other software, so close editors, dev servers, and package managers before a manual cleanup. An interrupted deletion can leave a partial dependency directory. Reinstall it.
+Deletion renames each artifact directory before removing it. It cannot eliminate races with other software, so close editors, dev servers, and package managers before a manual cleanup. An interrupted deletion can leave a partial artifact directory. Reinstall dependencies or rebuild the project.
 
-Space figures estimate allocated blocks. A question mark means source or Git activity already protects the project, so dependency measurement was unnecessary. Hard links shared with other projects or package stores and APFS clones can reduce actual space reclaimed. Large scans can take several minutes.
+Space figures estimate allocated blocks. A question mark means source or Git activity already protects the project, so artifact measurement was unnecessary. Hard links shared with other projects or package stores and APFS clones can reduce actual space reclaimed. Large scans can take several minutes.
 
 ## Validation
 
@@ -112,7 +165,7 @@ Space figures estimate allocated blocks. A question mark means source or Git act
 python3 -m unittest -v test_cleanup.py
 ```
 
-Tests use temporary real Git repositories and linked worktrees. They check different retention policies, deletion of old main checkouts, source preservation, standalone projects, workspace ownership, nested repositories, exclusions, policy switches and overrides, invalid config, schedule generation, live config changes, symlinks, and process detection with a real `lsof` call.
+Tests use temporary real Git repositories and linked worktrees. They check different retention policies, deletion of old main checkouts, source preservation, standalone projects, workspace ownership, nested repositories, exclusions, policy switches and overrides, invalid config, schedule generation, live config changes, symlinks, native build artifact recognition, tracked source protection, overlapping outputs, and process detection with a real `lsof` call.
 
 ## Local data
 

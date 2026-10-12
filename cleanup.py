@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Broom: prune node_modules from idle projects and worktrees. Preview by default."""
+"""Broom: prune dependencies and build artifacts from idle projects. Preview by default."""
 import argparse
 import fcntl
 import json
@@ -12,12 +12,13 @@ import tempfile
 import time
 import uuid
 import config as configuration
+import artifacts as catalog
 
 
 def git(path, *args):
     result = subprocess.run(
         ['git', '-C', str(path), *args], capture_output=True,
-        env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'}, timeout=15,
+        env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0', 'GIT_LITERAL_PATHSPECS': '1'}, timeout=15,
     )
     if result.returncode:
         raise RuntimeError(result.stderr.decode(errors='replace').strip())
@@ -43,12 +44,12 @@ def discover(roots, exclusions=()):
                 continue
             repository = '.git' in files + dirs
             owned = any(p in path.parents for p in found)
-            if repository or ('package.json' in files and not owned):
+            if repository or (catalog.is_project(files, dirs) and not owned):
                 found.add(path.resolve())
             dirs[:] = [d for d in dirs if d not in {
                 '.git', 'node_modules', 'target', 'vendor', '.next', '.nuxt',
                 'dist', 'build', '.cache', '.turbo', '.venv',
-            } and not (path / d).is_symlink()]
+            } and not (path / d).is_symlink() and catalog.classify(path, d, files) is None]
     return sorted(found)
 
 
@@ -84,18 +85,30 @@ def project_kind(path):
         if Path(git(path, 'rev-parse', '--show-toplevel')).resolve() != path:
             raise RuntimeError('Git project root does not match')
         return 'project', admin
-    if (path / 'package.json').is_file() and not (path / 'package.json').is_symlink():
+    files = [p.name for p in path.iterdir() if p.is_file() and not p.is_symlink()]
+    dirs = [p.name for p in path.iterdir() if p.is_dir() and not p.is_symlink()]
+    if catalog.is_project(files, dirs):
         return 'project', None
     raise RuntimeError('not a recognized project')
 
 
-def inspect(path, cutoff=None, exclusions=()):
+def git_ignored(path, target):
+    result = subprocess.run(['git', '-C', str(path), 'check-ignore', '--', str(target.relative_to(path))],
+                            capture_output=True, env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'}, timeout=15)
+    if result.returncode not in (0, 1):
+        raise RuntimeError('could not verify ignored build output')
+    return result.returncode == 0
+
+
+def inspect(path, cutoff=None, exclusions=(), enabled=None):
     """Scan source, dependencies, and Git files belonging to this project."""
     kind, admin = project_kind(path)
     if configuration.excluded(path, exclusions):
         raise RuntimeError('project is excluded')
     latest = 0.0
-    modules = []
+    enabled = set(enabled if enabled is not None else ['node_modules'])
+    outputs = []
+    protected = []
     for root, dirs, files in walk(path):
         here = Path(root)
         if configuration.excluded(here, exclusions):
@@ -112,16 +125,25 @@ def inspect(path, cutoff=None, exclusions=()):
             child = here / name
             if configuration.excluded(child, exclusions):
                 continue
-            if name == 'node_modules' and any(child in p.parents for p in exclusions):
-                continue
             if child.is_symlink():
                 latest = max(latest, child.lstat().st_mtime)
             elif name == '.git':
                 continue
-            elif name == 'node_modules':
-                modules.append(child)
             else:
-                kept.append(name)
+                artifact_type = catalog.classify(here, name, files)
+                if artifact_type == 'web' and name == 'dist' and (admin is None or not git_ignored(path, child)):
+                    artifact_type = None
+                if artifact_type:
+                    if any(child in p.parents for p in exclusions):
+                        protected.append({'path': str(child), 'reason': 'contains an excluded path'})
+                        continue
+                    selected = artifact_type in enabled
+                    if selected and admin is not None and git(path, 'ls-files', '--', str(child.relative_to(path))):
+                        selected = False
+                        protected.append({'path': str(child), 'reason': 'contains tracked files'})
+                    outputs.append({'path': str(child), 'type': artifact_type, 'selected': selected})
+                else:
+                    kept.append(name)
         dirs[:] = kept
     for root, dirs, files in walk(admin) if admin else []:
         here = Path(root)
@@ -134,24 +156,31 @@ def inspect(path, cutoff=None, exclusions=()):
             if name in {'FETCH_HEAD', 'gitdir', 'commondir'} or name.endswith('.lock'):
                 continue
             latest = max(latest, (here / name).lstat().st_mtime)
+    selected = [r for r in outputs if r['selected']]
+    row = {'path': str(path), 'kind': kind, 'last_activity': latest,
+           'node_modules': [r['path'] for r in selected if r['type'] == 'node_modules'],
+           'artifacts': selected, 'protected_artifacts': protected, 'estimated_bytes': None}
     if cutoff is not None and latest >= cutoff:
-        return {'path': str(path), 'kind': kind, 'last_activity': latest,
-                'node_modules': [str(p) for p in modules], 'estimated_bytes': None}
+        return row
     size = 0
     seen = set()
-    for module in modules:
+    for artifact in outputs:
+        module = Path(artifact['path'])
+        artifact_size = 0
         for root, dirs, files in walk(module):
             for entry in [Path(root)] + [Path(root) / n for n in files]:
                 stat = entry.lstat()
                 latest = max(latest, stat.st_mtime)
                 inode = (stat.st_dev, stat.st_ino)
-                if inode not in seen:
+                if artifact['selected'] and inode not in seen:
                     size += stat.st_blocks * 512
+                    artifact_size += stat.st_blocks * 512
                     seen.add(inode)
             for name in dirs:
                 latest = max(latest, (Path(root) / name).lstat().st_mtime)
-    return {'path': str(path), 'kind': kind, 'last_activity': latest,
-            'node_modules': [str(p) for p in modules], 'estimated_bytes': size}
+        artifact['estimated_bytes'] = artifact_size if artifact['selected'] else None
+    row.update(last_activity=latest, estimated_bytes=size)
+    return row
 
 
 def open_paths():
@@ -184,33 +213,49 @@ def space_summary(rows, apply):
     removed = [r for r in rows if r['status'] == 'removed']
     attempts = [r for r in rows if 'available_space_change_bytes' in r]
     measured = all(r['available_space_change_bytes'] is not None for r in attempts)
+    categories = {}
+    for row in eligible:
+        for artifact in row.get('artifacts', []):
+            item = categories.setdefault(artifact['type'], {'directories': 0, 'freeable_bytes_estimate': 0,
+                                                           'freed_bytes_estimate': 0})
+            item['directories'] += 1
+            item['freeable_bytes_estimate'] += artifact.get('estimated_bytes') or 0
+            if row['status'] == 'removed':
+                item['freed_bytes_estimate'] += artifact.get('estimated_bytes') or 0
     return {
         'eligible_projects': len(eligible),
         'freeable_bytes_estimate': sum(r['estimated_bytes'] for r in eligible),
         'removed_projects': len(removed),
         'freed_bytes_estimate': sum(r['estimated_bytes'] for r in removed),
+        'by_artifact': categories,
         'available_space_change_bytes': (
             sum(r['available_space_change_bytes'] for r in attempts)
             if apply and measured else None),
     }
 
 
-def remove_modules(path, cutoff, exclusions=(), expected_kind=None):
+def remove_artifacts(path, cutoff, exclusions=(), expected_kind=None, enabled=None, expected_paths=None):
     # Repeat the full activity scan immediately before changing anything.
-    current = inspect(path, cutoff, exclusions)
+    current = inspect(path, cutoff, exclusions, enabled)
     if expected_kind is not None and current['kind'] != expected_kind:
         raise RuntimeError('project kind changed during the scan')
     if current['last_activity'] >= cutoff or is_open(path, open_paths()):
         raise RuntimeError('project became active during the scan')
     removed = []
-    for value in current['node_modules']:
+    paths = [r['path'] for r in current['artifacts']]
+    if expected_paths is not None and set(paths) != set(expected_paths):
+        raise RuntimeError('artifact selection changed during the scan')
+    for value in paths:
         target = Path(value)
-        if (target.name != 'node_modules' or target.is_symlink() or path not in target.parents
+        if (target.is_symlink() or path not in target.parents
                 or configuration.excluded(target, exclusions)):
-            raise RuntimeError('dependency directory changed during the scan')
+            raise RuntimeError('artifact directory changed during the scan')
         # Do not resolve a path through a newly introduced symlink.
         if target.resolve() != target:
-            raise RuntimeError('dependency path now contains a symlink')
+            raise RuntimeError('artifact path now contains a symlink')
+        _, admin = project_kind(path)
+        if admin is not None and git(path, 'ls-files', '--', str(target.relative_to(path))):
+            raise RuntimeError('artifact now contains tracked files')
         staged = target.with_name('.worktree-cleanup-' + uuid.uuid4().hex)
         target.rename(staged)
         try:
@@ -223,6 +268,10 @@ def remove_modules(path, cutoff, exclusions=(), expected_kind=None):
     return removed
 
 
+def remove_modules(path, cutoff, exclusions=(), expected_kind=None):
+    return remove_artifacts(path, cutoff, exclusions, expected_kind, ['node_modules'])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=configuration.DEFAULT_CONFIG,
@@ -233,9 +282,13 @@ def main():
     parser.add_argument('--apply', action='store_true', help='delete the listed dependency directories')
     parser.add_argument('--scheduled', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--json', action='store_true', help='emit a machine-readable report')
+    parser.add_argument('--artifact', action='append', choices=catalog.TYPES,
+                        help='artifact types to clean for this run; repeatable, replaces config selection')
     args = parser.parse_args()
     try:
         config = configuration.load(args.config)
+        if args.artifact:
+            config['artifacts'] = {name: name in args.artifact for name in catalog.TYPES}
         if args.scheduled:
             if not config['schedule']['enabled']:
                 print(json.dumps({'mode': 'disabled', 'projects': [], 'errors': []})
@@ -257,13 +310,14 @@ def main():
         parser.error(str(error))
     roots = [r['path'] for r in config['directories']]
     exclusions = config['exclude']
+    enabled = [name for name, selected in config['artifacts'].items() if selected]
     now = time.time()
     rows = []
     errors = []
     try:
         opened = open_paths()
         found = discover(roots, exclusions)
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         parser.exit(1, f'Scan stopped: {error}\n')
     for path in found:
         row = None
@@ -277,16 +331,17 @@ def main():
                              'last_activity': None, 'node_modules': []})
                 continue
             cutoff = now - policy['idle_days'] * 86400
-            row = inspect(path, cutoff, exclusions)
+            row = inspect(path, cutoff, exclusions, enabled)
             row['idle_days'] = policy['idle_days']
-            row['status'] = ('no dependencies' if not row['node_modules'] else
+            row['status'] = ('no artifacts' if not row['artifacts'] else
                              'recent activity' if row['last_activity'] >= cutoff else
                              'open in a process' if is_open(path, opened) else 'candidate')
             rows.append(row)
             if args.apply and row['status'] == 'candidate':
                 before = available_bytes(path)
                 try:
-                    row['removed'] = remove_modules(path, cutoff, exclusions, kind)
+                    row['removed'] = remove_artifacts(path, cutoff, exclusions, kind, enabled,
+                                                     [r['path'] for r in row['artifacts']])
                     row['status'] = 'removed'
                 finally:
                     after = available_bytes(path)
@@ -298,7 +353,7 @@ def main():
             errors.append({'path': str(path), 'error': str(error)})
     summary = space_summary(rows, args.apply)
     report = {'mode': 'apply' if args.apply else 'preview', 'config': config['config'],
-              'policies': config['policies'], 'roots': [str(p) for p in roots],
+              'policies': config['policies'], 'artifact_types': enabled, 'roots': [str(p) for p in roots],
               'projects': rows, 'errors': errors, 'summary': summary}
     if args.json:
         print(json.dumps(report, indent=2))
@@ -308,10 +363,15 @@ def main():
             size = '      ?' if row['estimated_bytes'] is None else f"{row['estimated_bytes'] / 2**30:7.2f}"
             print(f"{row['status']:20} {size} GiB  "
                   f"{age:6.1f} days  {row['kind']:8} policy={row['idle_days']:g}d  {row['path']}")
+            for protected in row.get('protected_artifacts', []):
+                print(f"  Kept {protected['path']}: {protected['reason']}")
         for error in errors:
             print(f"Skipped {error['path']}: {error['error']}", file=sys.stderr)
         print(f"\nFreeable space, estimated: {summary['freeable_bytes_estimate'] / 2**30:.2f} GiB "
               f"across {summary['eligible_projects']} projects/worktrees.")
+        for name, item in sorted(summary['by_artifact'].items()):
+            print(f"  {name}: {item['freeable_bytes_estimate'] / 2**30:.2f} GiB "
+                  f"in {item['directories']} directories")
         if args.apply:
             print(f"Freed space, estimated: {summary['freed_bytes_estimate'] / 2**30:.2f} GiB "
                   f"across {summary['removed_projects']} completed cleanups.")

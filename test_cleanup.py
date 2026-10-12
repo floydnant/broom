@@ -13,6 +13,7 @@ from unittest.mock import patch
 import cleanup
 import config as configuration
 import schedule
+import artifacts as catalog
 
 
 class CleanupTests(unittest.TestCase):
@@ -288,6 +289,222 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(result['available_space_change_bytes'], 50)
         rows[1]['available_space_change_bytes'] = None
         self.assertIsNone(cleanup.space_summary(rows, True)['available_space_change_bytes'])
+
+    def native_fixture(self):
+        cases = {
+            'rust': ('Cargo.toml', '[package]\nname="demo"\nversion="0.1.0"\n', ['target']),
+            'gradle': ('build.gradle', '// build script', ['build', '.gradle', '.cxx']),
+            'flutter': ('pubspec.yaml', 'dependencies:\n  flutter:\n    sdk: flutter\n', ['build', '.dart_tool']),
+            'ios_build': ('Podfile', '# pods', ['build', 'DerivedData']),
+            'cocoapods': ('Podfile', '# pods', ['Pods']),
+            'web': ('package.json', '{"dependencies":{"next":"*","expo":"*","nuxt":"*","turbo":"*"}}',
+                    ['.next', '.expo', '.nuxt', '.output', '.turbo']),
+            'dotnet': ('Demo.csproj', '<Project/>', ['bin', 'obj']),
+            'swift': ('Package.swift', '// swift package', ['.build']),
+            'cmake': ('CMakeLists.txt', '# cmake', ['build']),
+        }
+        expected = {}
+        markers = []
+        for kind, (marker, content, names) in cases.items():
+            parent = self.worktree / 'native' / kind
+            parent.mkdir(parents=True)
+            (parent / marker).write_text(content)
+            markers.append(parent / marker)
+            if kind == 'cocoapods':
+                (parent / 'Podfile.lock').write_text('locked pods')
+                markers.append(parent / 'Podfile.lock')
+            expected[kind] = []
+            for name in names:
+                target = parent / name
+                target.mkdir()
+                (target / 'generated').write_text('rebuildable')
+                if kind == 'cmake':
+                    (target / 'CMakeCache.txt').write_text('# generated cache')
+                expected[kind].append(str(target))
+        self.age()
+        return expected, markers
+
+    def test_native_artifacts_are_opt_in_and_all_types_clean_source_stays(self):
+        expected, markers = self.native_fixture()
+        default = cleanup.inspect(self.worktree)
+        self.assertEqual({r['type'] for r in default['artifacts']}, {'node_modules'})
+        row = cleanup.inspect(self.worktree, enabled=catalog.TYPES)
+        self.assertEqual({r['type'] for r in row['artifacts']}, set(catalog.TYPES))
+        summary = cleanup.space_summary([{**row, 'status': 'candidate'}], False)
+        self.assertEqual(sum(r['freeable_bytes_estimate'] for r in summary['by_artifact'].values()), row['estimated_bytes'])
+        with patch.object(cleanup, 'open_paths', return_value=[]):
+            deleted = cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=catalog.TYPES)
+        for paths in expected.values():
+            for value in paths:
+                self.assertIn(value, deleted)
+                self.assertFalse(Path(value).exists())
+        for marker in markers:
+            self.assertTrue(marker.exists())
+        self.assertTrue((self.worktree / '.git').exists())
+
+    def test_native_category_selection(self):
+        expected, _ = self.native_fixture()
+        for kind in expected:
+            with self.subTest(kind=kind):
+                row = cleanup.inspect(self.worktree, enabled=[kind])
+                self.assertEqual({r['path'] for r in row['artifacts']}, set(expected[kind]))
+
+    def test_generic_names_are_not_artifacts_without_tool_evidence(self):
+        source = self.worktree / 'source'
+        for name in ('build', 'dist', 'bin', 'target', 'Pods', '.build'):
+            (source / name).mkdir(parents=True)
+            (source / name / 'keep').write_text('source')
+        self.age()
+        row = cleanup.inspect(self.worktree, enabled=catalog.TYPES)
+        self.assertEqual({r['type'] for r in row['artifacts']}, {'node_modules'})
+
+    def test_tracked_build_files_are_protected(self):
+        self.native_fixture()
+        tracked = self.worktree / 'native/rust/target/source.rs'
+        tracked.write_text('source')
+        self.run_git(self.worktree, 'add', str(tracked))
+        self.age()
+        row = cleanup.inspect(self.worktree, enabled=['rust'])
+        self.assertEqual(row['artifacts'], [])
+        self.assertEqual(row['protected_artifacts'][0]['reason'], 'contains tracked files')
+        with patch.object(cleanup, 'open_paths', return_value=[]):
+            self.assertEqual(cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['rust']), [])
+        self.assertTrue(tracked.exists())
+
+    def test_web_dist_requires_git_ignore(self):
+        (self.worktree / 'package.json').write_text('{"scripts":{"build":"tsc"}}')
+        dist = self.worktree / 'dist'
+        dist.mkdir()
+        (dist / 'generated').write_text('output')
+        self.age()
+        self.assertEqual(cleanup.inspect(self.worktree, enabled=['web'])['artifacts'], [])
+        (self.worktree / '.gitignore').write_text('dist/\n')
+        self.age()
+        row = cleanup.inspect(self.worktree, enabled=['web'])
+        self.assertEqual([r['path'] for r in row['artifacts']], [str(dist)])
+
+    def test_artifact_tree_is_selected_once(self):
+        self.native_fixture()
+        nested = self.worktree / 'native/web/.next/standalone/node_modules'
+        nested.mkdir(parents=True)
+        (nested / 'dep').write_text('dep')
+        self.age()
+        row = cleanup.inspect(self.worktree, enabled=['web', 'node_modules'])
+        paths = [r['path'] for r in row['artifacts']]
+        self.assertNotIn(str(nested), paths)
+        self.assertIn(str(nested.parents[1]), paths)
+
+    def test_recent_disabled_artifact_protects_other_artifacts(self):
+        self.native_fixture()
+        (self.worktree / 'native/rust/target/generated').write_text('recent build')
+        row = cleanup.inspect(self.worktree, enabled=['node_modules'])
+        self.assertGreater(row['last_activity'], self.cutoff)
+        with patch.object(cleanup, 'open_paths', return_value=[]), self.assertRaises(RuntimeError):
+            cleanup.remove_modules(self.worktree, self.cutoff)
+
+    def test_native_exclusion_protects_entire_artifact(self):
+        self.native_fixture()
+        target = self.worktree / 'native/rust/target'
+        row = cleanup.inspect(self.worktree, exclusions=[target / 'generated'], enabled=['rust'])
+        self.assertEqual(row['artifacts'], [])
+        self.assertTrue((target / 'generated').exists())
+
+    def test_new_tracked_file_during_preflight_blocks_deletion(self):
+        self.native_fixture()
+        original = cleanup.git
+        calls = 0
+        def changing_git(path, *args):
+            nonlocal calls
+            if args and args[0] == 'ls-files':
+                calls += 1
+                if calls >= 2:
+                    return 'native/rust/target/new-source.rs'
+            return original(path, *args)
+        with patch.object(cleanup, 'git', side_effect=changing_git), \
+                patch.object(cleanup, 'open_paths', return_value=[]), self.assertRaises(RuntimeError):
+            cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['rust'])
+        self.assertTrue((self.worktree / 'native/rust/target').exists())
+
+    def test_standalone_native_projects_are_discovered(self):
+        project = self.base / 'cargo-project'
+        project.mkdir()
+        (project / 'Cargo.toml').write_text('[package]\nname="demo"\nversion="0.1.0"')
+        (project / 'target').mkdir()
+        (project / 'target/generated').write_text('build')
+        self.assertIn(project, cleanup.discover([self.base]))
+        self.assertEqual(cleanup.project_kind(project), ('project', None))
+
+    def test_config_artifact_switches_and_unknown_types(self):
+        filename = self.write_config(policies='[artifacts]\nrust = true\nnode_modules = false\n')
+        config = configuration.load(filename)
+        self.assertTrue(config['artifacts']['rust'])
+        self.assertFalse(config['artifacts']['node_modules'])
+        self.assertFalse(config['artifacts']['cocoapods'])
+        filename = self.write_config(policies='[artifacts]\neverything = true\n')
+        with self.assertRaises(ValueError):
+            configuration.load(filename)
+
+    def test_native_cli_apply_reports_category_and_keeps_other_artifacts(self):
+        expected, markers = self.native_fixture()
+        result = subprocess.run(
+            [sys.executable, str(Path(cleanup.__file__).resolve()), '--root', str(self.base),
+             '--artifact', 'rust', '--apply', '--json'],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, 'TMPDIR': str(self.base)},
+        )
+        report = json.loads(result.stdout)
+        self.assertEqual(report['artifact_types'], ['rust'])
+        self.assertGreater(report['summary']['by_artifact']['rust']['freed_bytes_estimate'], 0)
+        self.assertFalse(Path(expected['rust'][0]).exists())
+        self.assertTrue(Path(expected['cocoapods'][0]).exists())
+        self.assertTrue((self.worktree / 'node_modules').exists())
+        self.assertTrue(all(p.exists() for p in markers))
+
+    def test_angular_cache_is_scoped_to_angular_project(self):
+        parent = self.worktree / 'angular'
+        target = parent / '.angular/cache'
+        target.mkdir(parents=True)
+        (target / 'generated').write_text('cache')
+        self.age()
+        self.assertEqual(cleanup.inspect(self.worktree, enabled=['web'])['artifacts'], [])
+        (parent / 'angular.json').write_text('{}')
+        self.age()
+        row = cleanup.inspect(self.worktree, enabled=['web'])
+        self.assertEqual([r['path'] for r in row['artifacts']], [str(target)])
+
+    def test_standalone_native_project_deletion(self):
+        project = self.base / 'swift-project'
+        project.mkdir()
+        (project / 'Package.swift').write_text('// swift package')
+        output = project / '.build'
+        output.mkdir()
+        (output / 'object').write_text('build output')
+        self.old = time.time() - 25 * 86400
+        self.age()
+        with patch.object(cleanup, 'open_paths', return_value=[]):
+            self.assertEqual(cleanup.remove_artifacts(project, time.time() - 21 * 86400,
+                                                     enabled=['swift']), [str(output)])
+        self.assertTrue((project / 'Package.swift').exists())
+
+    def test_native_symlink_points_outside_project_are_kept(self):
+        parent = self.worktree / 'rust-project'
+        parent.mkdir()
+        (parent / 'Cargo.toml').write_text('[package]')
+        outside = self.base / 'shared-target'
+        outside.mkdir()
+        (outside / 'keep').write_text('shared build')
+        (parent / 'target').symlink_to(outside, target_is_directory=True)
+        self.age()
+        self.assertEqual(cleanup.inspect(self.worktree, enabled=['rust'])['artifacts'], [])
+        self.assertTrue((outside / 'keep').exists())
+
+    def test_generated_dependency_checkouts_are_not_discovered_as_projects(self):
+        self.native_fixture()
+        checkout = self.worktree / 'native/swift/.build/checkouts/dependency'
+        checkout.mkdir(parents=True)
+        self.run_git(checkout, 'init', '-q')
+        (checkout / 'Package.swift').write_text('// dependency')
+        self.assertNotIn(checkout, cleanup.discover([self.base]))
 
 
 if __name__ == '__main__':

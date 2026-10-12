@@ -34,3 +34,16 @@ weekdays = []
 # Use "preview" to log candidates without deleting dependencies.
 # mode = "apply"
 mode = "preview"
+
+# Additional rebuildable artifacts are opt-in and use the same idle policies.
+[artifacts]
+node_modules = true
+rust = false
+gradle = false
+flutter = false
+ios_build = false
+cocoapods = false
+web = false
+dotnet = false
+swift = false
+cmake = false
