@@ -8,3 +8,4 @@
 !test_cleanup.py
 !broom.example.toml
 !artifacts.py
+!activity.py

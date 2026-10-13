@@ -47,3 +47,7 @@ web = false
 dotnet = false
 swift = false
 cmake = false
+
+[activity]
+# Private source inventories. Keep this outside your project directories.
+state_file = "~/.local/state/broom/activity.json"

@@ -41,6 +41,7 @@ The config controls:
 | `[policies.worktrees]` | `enabled` and `idle_days` for linked Git worktrees, default seven days |
 | `[policies.projects]` | `enabled` and `idle_days` for regular projects, default 21 days |
 | `[artifacts]` | Enable known cleanup categories, all new categories are opt-in |
+| `[activity]` | Optional private `state_file` for source inventories |
 | `[schedule]` | `enabled`, local `time`, `weekdays`, and `mode` |
 
 The example scan directories are `~/projects`, `~/.t3/worktrees`, and `~/.codex/worktrees`. Change them to match your setup. Regular projects include main Git checkouts, Git submodules, and standalone Node, Cargo, Gradle, Flutter, Xcode, .NET, SwiftPM, or CMake projects recognized by their manifests. Workspace packages belong to their containing project. Nested Git repositories have their own policy and activity checks.
@@ -87,7 +88,7 @@ swift = false
 cmake = false
 ```
 
-Each category inherits the existing project and worktree idle policies, including directory overrides. A recent source edit or build protects the entire project. Retention and artifact selection changes take effect on the next scheduled run without reinstalling the job.
+Each category inherits the existing project and worktree idle policies, including directory overrides. A recent source edit or meaningful Git activity protects the entire project. A recent install or build protects only the corresponding artifact directory. Retention and artifact selection changes take effect on the next scheduled run without reinstalling the job.
 
 | Category | Selected directories and required evidence | Recreate with |
 | --- | --- | --- |
@@ -104,7 +105,7 @@ Each category inherits the existing project and worktree idle policies, includin
 
 Framework caches require the corresponding package dependency or config file. Generic `dist` requires an adjacent package manifest with a recognized build command and an explicit Git ignore match. A directory name alone does not qualify.
 
-Broom keeps any artifact containing a file tracked in the owning repository. It rechecks tracked files and the selected artifact paths before deletion. Excluding a path inside an artifact protects that entire artifact. Symlinked roots stay untouched. Nested output trees count once, so `.next/standalone/node_modules` belongs to the `.next` artifact rather than a second cleanup selection. Disabled artifact trees retain their nested dependencies too. Their timestamps still count as project activity.
+Broom keeps any artifact containing a file tracked in the owning repository. It rechecks tracked files and the selected artifact paths before deletion. Excluding a path inside an artifact protects that entire artifact. Symlinked roots stay untouched. Nested output trees count once, so `.next/standalone/node_modules` belongs to the `.next` artifact rather than a second cleanup selection. Disabled artifact trees retain their nested dependencies too. Their timestamps do not affect unrelated artifact categories.
 
 The rules select project-local artifacts. Global Xcode DerivedData, Xcode archives, simulator data, SDKs, global Gradle caches, Cargo registries, source directories, native `ios` and `android` project folders, signing files, and lockfiles remain outside these rules. Custom output paths are not automatically inferred.
 
@@ -149,9 +150,28 @@ Installation does not immediately run cleanup. macOS can run a missed calendar j
 
 ## What counts as activity
 
-The cleaner checks modification times across source files, untracked files, dependency contents, build output, and relevant Git files. The newest timestamp must be older than the applicable retention policy. Git administration directory timestamps, transient locks, registration pointers, background fetch records, shared objects, remote refs, and other worktrees' metadata do not count.
+Broom checks project activity and artifact activity separately, using the applicable project or worktree idle threshold for both.
 
-It also skips projects with files or working directories open in a current-user process, then repeats the activity check before deletion. Opening or reading a file does not reliably change its modification time. To extend retention, run `touch /path/to/project/.keep-dependencies`. A future modification time also keeps the project.
+Project activity comes from source-file modification times, meaningful Git HEAD reflog events, and branch or commit changes observed between scans. In Git repositories, source files are tracked files and non-ignored untracked files. Standalone projects use files outside recognized artifact directories. Directory timestamps, Git index refreshes, background fetches, ignored generated files, and Finder metadata do not count as source activity. A `.keep-dependencies` file counts even if Git ignores it.
+
+Once the project is idle, Broom checks each selected artifact directory's own modification timestamps. A recent dependency installation keeps that `node_modules`, but does not keep an old Rust `target`. A recent build keeps that build directory without extending another artifact's retention. Artifact directory timestamps count within that installation, but parent project directory timestamps do not. Broom's own cleanup never resets source retention.
+
+Files or working directories open in a current-user process protect the whole project. Broom repeats the source, artifact, registration, and tracked-file checks before deletion. An artifact that becomes recent between preview and deletion blocks that project's cleanup for the run.
+
+A small private source inventory detects file additions, changes, and deletions between scans, including untracked source files. It also detects file changes with preserved modification times using metadata fingerprints. Newly observed changes extend protection from the time Broom notices them. Directory timestamps are unnecessary. The first scan establishes the inventory and cannot reconstruct earlier untracked deletions. Missing tracked source on that first scan receives one retention window of protection.
+
+Both previews and apply runs update the inventory. The state stores hashed project and source paths, metadata, and hashed Git identity, without source contents. By default it lives outside repositories:
+
+```toml
+[activity]
+state_file = "~/.local/state/broom/activity.json"
+```
+
+Use `--state-file /path/to/activity.json` for a one-time override. Keep the same state file between normal runs. Corrupt state stops the run, and Broom verifies it can save state before deleting artifacts. State files stay private and should not be committed or shared. Removing the state file resets the source inventory on the next scan.
+
+Text and JSON reports explain project activity with `activity_reason` and `activity_path`. Each artifact has its own `last_activity`, `activity_path`, `status`, and `eligible` flag. Space totals count only eligible artifacts, so a partially cleanable project can retain its recent installations while deleting old outputs.
+
+Opening or reading a file does not reliably change its modification time. To extend retention, run `touch /path/to/project/.keep-dependencies`. A future source-file modification time also keeps the project.
 
 It verifies Git project roots and linked worktree registration, protects tracked artifacts, skips symlinked artifact directories, and does not follow symlinks. An unreadable path or failed activity check skips cleanup for that project. An unavailable process check stops the run. Simultaneous runs share a lock.
 
@@ -169,6 +189,6 @@ Tests use temporary real Git repositories and linked worktrees. They check diffe
 
 ## Local data
 
-Personal configuration, generated schedules, scan reports, logs, and caches stay out of Git. Reports and logs can contain absolute paths and project names. Review them before sharing.
+Personal configuration, activity state, generated schedules, scan reports, logs, and caches stay out of Git. Reports and logs can contain absolute paths and project names. Review them before sharing.
 
 The repository includes `broom.example.toml`. Copy it to `broom.toml` and edit your local copy. If that local config is absent, the scripts use the example config.

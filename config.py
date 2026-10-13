@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import tomllib
 import artifacts
+from activity import DEFAULT_STATE
 
 DEFAULT_CONFIG = Path(__file__).with_name('broom.toml')
 WEEKDAYS = {'mon': 1, 'tue': 2, 'wed': 3, 'thu': 4, 'fri': 5, 'sat': 6, 'sun': 0}
@@ -38,12 +39,15 @@ def load(filename=DEFAULT_CONFIG):
         filename = DEFAULT_CONFIG.with_name('broom.example.toml').resolve()
     with filename.open('rb') as source:
         raw = tomllib.load(source)
-    keys(raw, ['version', 'directories', 'exclude', 'policies', 'schedule', 'artifacts'], 'config')
+    keys(raw, ['version', 'directories', 'exclude', 'policies', 'schedule', 'artifacts', 'activity'], 'config')
     if type(raw.get('version')) is not int or raw['version'] != 1:
         raise ValueError('config version must be 1')
     policies = raw.get('policies', {})
     keys(policies, ['worktrees', 'projects'], 'policies')
     result = {'config': str(filename), 'policies': {}}
+    tracking = raw.get('activity', {})
+    keys(tracking, ['state_file'], 'activity')
+    result['state_file'] = path(tracking.get('state_file', str(DEFAULT_STATE)), filename.parent)
     options = raw.get('artifacts', {})
     keys(options, artifacts.TYPES, 'artifacts')
     result['artifacts'] = {name: boolean(options.get(name, name == 'node_modules'),

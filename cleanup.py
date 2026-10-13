@@ -13,6 +13,7 @@ import time
 import uuid
 import config as configuration
 import artifacts as catalog
+import activity
 
 
 def git(path, *args):
@@ -22,7 +23,8 @@ def git(path, *args):
     )
     if result.returncode:
         raise RuntimeError(result.stderr.decode(errors='replace').strip())
-    return result.stdout.decode(errors='surrogateescape').strip()
+    data = result.stdout.decode(errors='surrogateescape')
+    return data if '\0' in data else data.strip()
 
 
 def walk(path):
@@ -100,86 +102,153 @@ def git_ignored(path, target):
     return result.returncode == 0
 
 
-def inspect(path, cutoff=None, exclusions=(), enabled=None):
-    """Scan source, dependencies, and Git files belonging to this project."""
+def git_activity(path, admin):
+    if admin is None:
+        return None, 0.0, None
+    head = (admin / 'HEAD').read_text().strip()
+    try:
+        commit = git(path, 'rev-parse', '--verify', 'HEAD')
+    except RuntimeError:
+        commit = ''  # An initialized repository can have no commits yet.
+    identity = activity.fingerprint(head + '\n' + commit)
+    log = admin / 'logs/HEAD'
+    timestamp = 0.0
+    if log.is_file():
+        lines = log.read_text(errors='surrogateescape').splitlines()
+        for line in reversed(lines):
+            header, _, message = line.partition('\t')
+            identifiers = header.split(' ', 2)
+            checkout = message.removeprefix('checkout: moving from ').split(' to ', 1)
+            branch_changed = (message.startswith('checkout: moving from ') and len(checkout) == 2
+                              and checkout[0] != checkout[1])
+            if len(identifiers) < 2 or identifiers[0] == identifiers[1] and not branch_changed:
+                continue
+            try:
+                timestamp = float(header.rsplit(' ', 2)[-2])
+            except (ValueError, IndexError):
+                raise RuntimeError('cannot parse Git HEAD activity')
+            break
+    return identity, timestamp, 'Git checkout or commit recorded in HEAD reflog' if timestamp else None
+
+
+def inspect(path, cutoff=None, exclusions=(), enabled=None, state=None, observed_at=None):
+    """Keep source activity separate from each selected artifact's activity."""
     kind, admin = project_kind(path)
     if configuration.excluded(path, exclusions):
         raise RuntimeError('project is excluded')
-    latest = 0.0
+    now = time.time() if observed_at is None else observed_at
     enabled = set(enabled if enabled is not None else ['node_modules'])
-    outputs = []
-    protected = []
+    outputs, protected, source_files, excluded_trees = [], [], {}, []
+    latest, reason, recent_path = 0.0, None, None
+    listed = set(git(path, 'ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0')) if admin else None
+    listed = {name for name in listed if name} if listed is not None else None
+
+    def source(entry):
+        nonlocal latest, reason, recent_path
+        relative = str(entry.relative_to(path))
+        if entry.name in {'.git', '.DS_Store', 'Thumbs.db'} or configuration.excluded(entry, exclusions) or (state and entry == state.filename):
+            return
+        if listed is not None and relative not in listed and entry.name != '.keep-dependencies':
+            return
+        try:
+            stat = entry.lstat()
+        except FileNotFoundError:
+            source_files[activity.fingerprint(relative)] = None
+            return
+        if entry.is_dir() and not entry.is_symlink():
+            return
+        source_files[activity.fingerprint(relative)] = [stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino]
+        if stat.st_mtime > latest:
+            latest, reason, recent_path = stat.st_mtime, 'source file modified', relative
+
     for root, dirs, files in walk(path):
         here = Path(root)
-        if configuration.excluded(here, exclusions):
+        if configuration.excluded(here, exclusions) or (here != path and '.git' in files + dirs):
+            excluded_trees.append(here)
             dirs[:] = []
             continue
-        if here != path and '.git' in files + dirs:
-            dirs[:] = []  # A nested repository owns its own dependencies.
-            continue
-        latest = max(latest, here.stat().st_mtime)
         for name in files:
-            latest = max(latest, (here / name).lstat().st_mtime)
+            source(here / name)
         kept = []
         for name in dirs:
             child = here / name
             if configuration.excluded(child, exclusions):
+                excluded_trees.append(child)
                 continue
             if child.is_symlink():
-                latest = max(latest, child.lstat().st_mtime)
+                source(child)
             elif name == '.git':
-                continue
+                excluded_trees.append(child)
             else:
                 artifact_type = catalog.classify(here, name, files)
                 if artifact_type == 'web' and name == 'dist' and (admin is None or not git_ignored(path, child)):
                     artifact_type = None
                 if artifact_type:
+                    excluded_trees.append(child)
                     if any(child in p.parents for p in exclusions):
                         protected.append({'path': str(child), 'reason': 'contains an excluded path'})
                         continue
-                    selected = artifact_type in enabled
-                    if selected and admin is not None and git(path, 'ls-files', '--', str(child.relative_to(path))):
-                        selected = False
+                    tracked = git(path, 'ls-files', '-z', '--', str(child.relative_to(path))) if admin else ''
+                    if tracked:
                         protected.append({'path': str(child), 'reason': 'contains tracked files'})
-                    outputs.append({'path': str(child), 'type': artifact_type, 'selected': selected})
+                        for relative in tracked.split('\0'):
+                            if relative:
+                                source(path / relative)
+                        continue
+                    if artifact_type not in enabled:
+                        continue
+                    outputs.append({'path': str(child), 'type': artifact_type, 'selected': True,
+                                    'eligible': False, 'status': 'recent source', 'estimated_bytes': None})
                 else:
                     kept.append(name)
         dirs[:] = kept
-    for root, dirs, files in walk(admin) if admin else []:
-        here = Path(root)
-        # Shared objects, other worktrees, and remote refs are not this project's activity.
-        dirs[:] = [d for d in dirs if d not in {'objects', 'worktrees', 'modules', 'remotes'}
-                   and not (here / d).is_symlink()]
-        # Status checks create/remove locks, changing directory timestamps.
-        # Background fetches also do not mean this worktree was used.
-        for name in files:
-            if name in {'FETCH_HEAD', 'gitdir', 'commondir'} or name.endswith('.lock'):
-                continue
-            latest = max(latest, (here / name).lstat().st_mtime)
-    selected = [r for r in outputs if r['selected']]
-    row = {'path': str(path), 'kind': kind, 'last_activity': latest,
-           'node_modules': [r['path'] for r in selected if r['type'] == 'node_modules'],
-           'artifacts': selected, 'protected_artifacts': protected, 'estimated_bytes': None}
+    if listed is not None:
+        # Missing tracked files are absent from os.walk, but belong in the inventory.
+        for relative in listed:
+            entry = path / relative
+            if not any(tree == entry or tree in entry.parents for tree in excluded_trees):
+                source(entry)
+    identity, git_time, git_reason = git_activity(path, admin)
+    if git_time > latest:
+        latest, reason, recent_path = git_time, git_reason, None
+    if state is not None:
+        scope = activity.fingerprint('\0'.join(sorted(str(p) for p in exclusions if path in p.parents)))
+        observed, observed_reason = state.observe(path, source_files, identity, now, scope)
+        if observed > latest:
+            latest, reason, recent_path = observed, observed_reason, None
+    row = {'path': str(path), 'kind': kind, 'last_activity': latest, 'activity_reason': reason,
+           'activity_path': recent_path,
+           'node_modules': [r['path'] for r in outputs if r['type'] == 'node_modules'],
+           'artifacts': outputs, 'protected_artifacts': protected, 'estimated_bytes': None}
     if cutoff is not None and latest >= cutoff:
         return row
-    size = 0
-    seen = set()
+    size, seen = 0, set()
     for artifact in outputs:
-        module = Path(artifact['path'])
-        artifact_size = 0
-        for root, dirs, files in walk(module):
-            for entry in [Path(root)] + [Path(root) / n for n in files]:
+        artifact_latest, artifact_path, blocks, inodes = 0.0, None, 0, set()
+        entries = []
+        for root, dirs, files in walk(Path(artifact['path'])):
+            for entry in [Path(root)] + [Path(root) / n for n in files + dirs]:
                 stat = entry.lstat()
-                latest = max(latest, stat.st_mtime)
+                if stat.st_mtime > artifact_latest:
+                    artifact_latest, artifact_path = stat.st_mtime, str(entry.relative_to(path))
                 inode = (stat.st_dev, stat.st_ino)
-                if artifact['selected'] and inode not in seen:
-                    size += stat.st_blocks * 512
-                    artifact_size += stat.st_blocks * 512
+                if inode not in inodes:
+                    inodes.add(inode)
+                    entries.append((inode, stat.st_blocks * 512))
+                    blocks += stat.st_blocks * 512
+        artifact.update(last_activity=artifact_latest, activity_path=artifact_path,
+                        estimated_bytes=blocks,
+                        eligible=cutoff is None or artifact_latest < cutoff)
+        artifact['status'] = 'candidate' if artifact['eligible'] else 'recent artifact'
+        if artifact['eligible']:
+            accounted = 0
+            for inode, allocation in entries:
+                if inode not in seen:
+                    size += allocation
+                    accounted += allocation
                     seen.add(inode)
-            for name in dirs:
-                latest = max(latest, (Path(root) / name).lstat().st_mtime)
-        artifact['estimated_bytes'] = artifact_size if artifact['selected'] else None
-    row.update(last_activity=latest, estimated_bytes=size)
+            artifact['estimated_bytes'] = accounted
+    row['estimated_bytes'] = size
     return row
 
 
@@ -216,6 +285,8 @@ def space_summary(rows, apply):
     categories = {}
     for row in eligible:
         for artifact in row.get('artifacts', []):
+            if not artifact.get('eligible', True):
+                continue
             item = categories.setdefault(artifact['type'], {'directories': 0, 'freeable_bytes_estimate': 0,
                                                            'freed_bytes_estimate': 0})
             item['directories'] += 1
@@ -234,15 +305,15 @@ def space_summary(rows, apply):
     }
 
 
-def remove_artifacts(path, cutoff, exclusions=(), expected_kind=None, enabled=None, expected_paths=None):
+def remove_artifacts(path, cutoff, exclusions=(), expected_kind=None, enabled=None, expected_paths=None, state=None):
     # Repeat the full activity scan immediately before changing anything.
-    current = inspect(path, cutoff, exclusions, enabled)
+    current = inspect(path, cutoff, exclusions, enabled, state)
     if expected_kind is not None and current['kind'] != expected_kind:
         raise RuntimeError('project kind changed during the scan')
     if current['last_activity'] >= cutoff or is_open(path, open_paths()):
         raise RuntimeError('project became active during the scan')
     removed = []
-    paths = [r['path'] for r in current['artifacts']]
+    paths = [r['path'] for r in current['artifacts'] if r['eligible']]
     if expected_paths is not None and set(paths) != set(expected_paths):
         raise RuntimeError('artifact selection changed during the scan')
     for value in paths:
@@ -284,9 +355,12 @@ def main():
     parser.add_argument('--json', action='store_true', help='emit a machine-readable report')
     parser.add_argument('--artifact', action='append', choices=catalog.TYPES,
                         help='artifact types to clean for this run; repeatable, replaces config selection')
+    parser.add_argument('--state-file', type=Path, help='override the private activity state file')
     args = parser.parse_args()
     try:
         config = configuration.load(args.config)
+        if args.state_file:
+            config['state_file'] = args.state_file.expanduser().resolve()
         if args.artifact:
             config['artifacts'] = {name: name in args.artifact for name in catalog.TYPES}
         if args.scheduled:
@@ -315,6 +389,8 @@ def main():
     rows = []
     errors = []
     try:
+        state = activity.ActivityStore(config['state_file'])
+        state.save()
         opened = open_paths()
         found = discover(roots, exclusions)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
@@ -331,17 +407,23 @@ def main():
                              'last_activity': None, 'node_modules': []})
                 continue
             cutoff = now - policy['idle_days'] * 86400
-            row = inspect(path, cutoff, exclusions, enabled)
+            row = inspect(path, cutoff, exclusions, enabled, state, now)
             row['idle_days'] = policy['idle_days']
             row['status'] = ('no artifacts' if not row['artifacts'] else
-                             'recent activity' if row['last_activity'] >= cutoff else
-                             'open in a process' if is_open(path, opened) else 'candidate')
+                             'recent source activity' if row['last_activity'] >= cutoff else
+                             'open in a process' if is_open(path, opened) else
+                             'candidate' if any(a['eligible'] for a in row['artifacts']) else 'recent artifacts')
+            if row['status'] == 'open in a process':
+                row['estimated_bytes'] = 0
+                for artifact in row['artifacts']:
+                    artifact.update(eligible=False, status='open in a process')
             rows.append(row)
             if args.apply and row['status'] == 'candidate':
                 before = available_bytes(path)
                 try:
+                    state.save()
                     row['removed'] = remove_artifacts(path, cutoff, exclusions, kind, enabled,
-                                                     [r['path'] for r in row['artifacts']])
+                                                     [r['path'] for r in row['artifacts'] if r['eligible']], state)
                     row['status'] = 'removed'
                 finally:
                     after = available_bytes(path)
@@ -351,6 +433,10 @@ def main():
             if row is not None and row['status'] == 'candidate':
                 row['status'] = 'cleanup failed'
             errors.append({'path': str(path), 'error': str(error)})
+    try:
+        state.save()
+    except (OSError, ValueError) as error:
+        errors.append({'path': str(config['state_file']), 'error': f'could not save activity state: {error}'})
     summary = space_summary(rows, args.apply)
     report = {'mode': 'apply' if args.apply else 'preview', 'config': config['config'],
               'policies': config['policies'], 'artifact_types': enabled, 'roots': [str(p) for p in roots],
@@ -365,6 +451,12 @@ def main():
                   f"{age:6.1f} days  {row['kind']:8} policy={row['idle_days']:g}d  {row['path']}")
             for protected in row.get('protected_artifacts', []):
                 print(f"  Kept {protected['path']}: {protected['reason']}")
+            if row.get('activity_reason'):
+                detail = f", {row['activity_path']}" if row.get('activity_path') else ''
+                print(f"  Project activity: {row['activity_reason']}{detail}")
+            for artifact in row.get('artifacts', []):
+                label = 'removed' if artifact['path'] in row.get('removed', []) else artifact['status']
+                print(f"  {artifact['type']}: {label}, {artifact['path']}")
         for error in errors:
             print(f"Skipped {error['path']}: {error['error']}", file=sys.stderr)
         print(f"\nFreeable space, estimated: {summary['freeable_bytes_estimate'] / 2**30:.2f} GiB "

@@ -14,6 +14,7 @@ import cleanup
 import config as configuration
 import schedule
 import artifacts as catalog
+import activity
 
 
 class CleanupTests(unittest.TestCase):
@@ -21,6 +22,17 @@ class CleanupTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
+        state_default = patch.object(configuration, 'DEFAULT_STATE', self.base / 'broom-state.json')
+        state_default.start()
+        self.addCleanup(state_default.stop)
+        original_load = configuration.load
+        def isolated_config(*args, **kwargs):
+            result = original_load(*args, **kwargs)
+            result['state_file'] = self.base / 'broom-state.json'
+            return result
+        isolated_loader = patch.object(configuration, 'load', side_effect=isolated_config)
+        isolated_loader.start()
+        self.addCleanup(isolated_loader.stop)
         self.repo = self.base / 'main'
         self.repo.mkdir()
         self.run_git(self.repo, 'init', '-q')
@@ -44,7 +56,17 @@ class CleanupTests(unittest.TestCase):
     def age(self):
         for root, dirs, files in os.walk(self.base):
             for name in dirs + files:
-                os.utime(Path(root) / name, (self.old, self.old), follow_symlinks=False)
+                entry = Path(root) / name
+                if '.git' in entry.parts and 'logs' in entry.parts and entry.is_file():
+                    lines = []
+                    for line in entry.read_text().splitlines():
+                        header, separator, message = line.partition('\t')
+                        fields = header.rsplit(' ', 2)
+                        if len(fields) == 3:
+                            header = fields[0] + ' ' + str(int(self.old)) + ' ' + fields[2]
+                        lines.append(header + separator + message)
+                    entry.write_text('\n'.join(lines) + '\n')
+                os.utime(entry, (self.old, self.old), follow_symlinks=False)
         os.utime(self.base, (self.old, self.old))
 
     def test_discovery_distinguishes_main_checkout_and_worktree(self):
@@ -59,7 +81,7 @@ class CleanupTests(unittest.TestCase):
             self.assertFalse(cleanup.main())
         report = json.loads(out.getvalue())
         self.assertEqual(report['projects'][0]['status'], 'candidate')
-        self.assertEqual(report['projects'][1]['status'], 'recent activity')
+        self.assertEqual(report['projects'][1]['status'], 'recent source activity')
         self.assertEqual(report['summary']['eligible_projects'], 1)
         self.assertEqual(report['summary']['freeable_bytes_estimate'], report['projects'][0]['estimated_bytes'])
         self.assertEqual(report['summary']['freed_bytes_estimate'], 0)
@@ -88,8 +110,7 @@ class CleanupTests(unittest.TestCase):
             cleanup.remove_modules(self.worktree, self.cutoff)
 
     def test_git_activity_protects_worktree(self):
-        admin = cleanup.linked_git_dir(self.worktree)
-        os.utime(admin / 'HEAD', None)
+        self.run_git(self.worktree, 'checkout', '-qb', 'new-branch')
         self.assertGreater(cleanup.inspect(self.worktree)['last_activity'], self.cutoff)
 
     def test_git_housekeeping_does_not_reset_retention(self):
@@ -107,7 +128,10 @@ class CleanupTests(unittest.TestCase):
 
     def test_recent_dependency_change_protects_worktree(self):
         os.utime(self.worktree / 'node_modules/pkg/index.js', None)
-        self.assertGreater(cleanup.inspect(self.worktree)['last_activity'], self.cutoff)
+        row = cleanup.inspect(self.worktree, self.cutoff)
+        self.assertLess(row['last_activity'], self.cutoff)
+        self.assertEqual(row['artifacts'][0]['status'], 'recent artifact')
+        self.assertFalse(row['artifacts'][0]['eligible'])
 
     def test_symlinked_modules_do_not_target_external_data(self):
         external = self.base / 'external'
@@ -150,7 +174,7 @@ class CleanupTests(unittest.TestCase):
     def test_real_cli_apply(self):
         result = subprocess.run(
             [sys.executable, str(Path(cleanup.__file__).resolve()),
-            '--root', str(self.base), '--apply', '--json'],
+             '--root', str(self.base), '--state-file', str(self.base / 'broom-state.json'), '--apply', '--json'],
             capture_output=True, text=True, check=True,
             env={**os.environ, 'TMPDIR': str(self.base)},
         )
@@ -394,13 +418,14 @@ class CleanupTests(unittest.TestCase):
         self.assertNotIn(str(nested), paths)
         self.assertIn(str(nested.parents[1]), paths)
 
-    def test_recent_disabled_artifact_protects_other_artifacts(self):
+    def test_recent_disabled_artifact_does_not_protect_other_artifacts(self):
         self.native_fixture()
         (self.worktree / 'native/rust/target/generated').write_text('recent build')
         row = cleanup.inspect(self.worktree, enabled=['node_modules'])
-        self.assertGreater(row['last_activity'], self.cutoff)
-        with patch.object(cleanup, 'open_paths', return_value=[]), self.assertRaises(RuntimeError):
+        self.assertLess(row['last_activity'], self.cutoff)
+        with patch.object(cleanup, 'open_paths', return_value=[]):
             cleanup.remove_modules(self.worktree, self.cutoff)
+        self.assertTrue((self.worktree / 'native/rust/target').exists())
 
     def test_native_exclusion_protects_entire_artifact(self):
         self.native_fixture()
@@ -415,9 +440,9 @@ class CleanupTests(unittest.TestCase):
         calls = 0
         def changing_git(path, *args):
             nonlocal calls
-            if args and args[0] == 'ls-files':
+            if args and args[0] == 'ls-files' and '-z' not in args:
                 calls += 1
-                if calls >= 2:
+                if calls >= 1:
                     return 'native/rust/target/new-source.rs'
             return original(path, *args)
         with patch.object(cleanup, 'git', side_effect=changing_git), \
@@ -448,7 +473,7 @@ class CleanupTests(unittest.TestCase):
         expected, markers = self.native_fixture()
         result = subprocess.run(
             [sys.executable, str(Path(cleanup.__file__).resolve()), '--root', str(self.base),
-             '--artifact', 'rust', '--apply', '--json'],
+             '--artifact', 'rust', '--state-file', str(self.base / 'broom-state.json'), '--apply', '--json'],
             capture_output=True, text=True, check=True,
             env={**os.environ, 'TMPDIR': str(self.base)},
         )
@@ -505,6 +530,154 @@ class CleanupTests(unittest.TestCase):
         self.run_git(checkout, 'init', '-q')
         (checkout / 'Package.swift').write_text('// dependency')
         self.assertNotIn(checkout, cleanup.discover([self.base]))
+
+    def test_recent_install_keeps_only_that_artifact(self):
+        expected, _ = self.native_fixture()
+        os.utime(self.worktree / 'node_modules', None)
+        row = cleanup.inspect(self.worktree, self.cutoff, enabled=['rust', 'node_modules'])
+        by_type = {r['type']: r for r in row['artifacts']}
+        self.assertLess(row['last_activity'], self.cutoff)
+        self.assertFalse(by_type['node_modules']['eligible'])
+        self.assertTrue(by_type['rust']['eligible'])
+        summary = cleanup.space_summary([{**row, 'status': 'candidate'}], False)
+        self.assertEqual(set(summary['by_artifact']), {'rust'})
+        with patch.object(cleanup, 'open_paths', return_value=[]):
+            deleted = cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['rust', 'node_modules'])
+        self.assertEqual(deleted, expected['rust'])
+        self.assertTrue((self.worktree / 'node_modules').exists())
+
+    def test_directory_timestamps_and_index_refresh_do_not_count(self):
+        state = activity.ActivityStore(self.base / 'state.json')
+        before = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        admin = cleanup.linked_git_dir(self.worktree)
+        for path in (self.worktree, admin / 'index', admin / 'HEAD', admin / 'logs/HEAD'):
+            os.utime(path, None)
+        after = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertEqual(before['last_activity'], after['last_activity'])
+        self.assertTrue(after['artifacts'][0]['eligible'])
+
+    def test_cleanup_does_not_reset_source_retention(self):
+        self.native_fixture()
+        state = activity.ActivityStore(self.base / 'state.json')
+        before = cleanup.inspect(self.worktree, self.cutoff, enabled=['rust', 'node_modules'], state=state)
+        with patch.object(cleanup, 'open_paths', return_value=[]):
+            cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['node_modules'], state=state)
+        state.save()
+        after = cleanup.inspect(self.worktree, self.cutoff, enabled=['rust'],
+                                state=activity.ActivityStore(state.filename))
+        self.assertEqual(before['last_activity'], after['last_activity'])
+        self.assertTrue(after['artifacts'][0]['eligible'])
+
+    def test_untracked_source_deletion_detected_once_and_persists(self):
+        file = self.worktree / 'draft.ts'
+        file.write_text('// source')
+        self.age()
+        state = activity.ActivityStore(self.base / 'state.json')
+        initial = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertLess(initial['last_activity'], self.cutoff)
+        file.unlink()
+        deleted = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertGreater(deleted['last_activity'], self.cutoff)
+        self.assertIn('deleted', deleted['activity_reason'])
+        state.save()
+        again = cleanup.inspect(self.worktree, self.cutoff, state=activity.ActivityStore(state.filename))
+        self.assertEqual(deleted['last_activity'], again['last_activity'])
+
+    def test_ignored_generated_file_changes_do_not_count_as_source(self):
+        (self.worktree / '.gitignore').write_text('noise/\n')
+        folder = self.worktree / 'noise'
+        folder.mkdir()
+        (folder / 'log').write_text('old log')
+        self.age()
+        state = activity.ActivityStore(self.base / 'state.json')
+        before = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        (folder / 'log').write_text('new log')
+        (self.worktree / '.DS_Store').write_text('Finder metadata')
+        after = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertEqual(before['last_activity'], after['last_activity'])
+
+    def test_source_changes_with_preserved_mtime_still_count_after_baseline(self):
+        state = activity.ActivityStore(self.base / 'state.json')
+        cleanup.inspect(self.worktree, self.cutoff, state=state)
+        file = self.worktree / 'package.json'
+        old = file.stat().st_mtime_ns
+        file.write_text('{"changed":true}')
+        os.utime(file, ns=(old, old))
+        row = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertGreater(row['last_activity'], self.cutoff)
+
+    def test_missing_tracked_source_first_scan_protects_once(self):
+        (self.worktree / 'package.json').unlink()
+        state = activity.ActivityStore(self.base / 'state.json')
+        first = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertEqual(first['activity_reason'], 'missing tracked source first observed')
+        next_scan = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertEqual(first['last_activity'], next_scan['last_activity'])
+
+    def test_git_branch_change_persists_activity_in_state(self):
+        state = activity.ActivityStore(self.base / 'state.json')
+        cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.run_git(self.worktree, 'checkout', '-qb', 'another-branch')
+        row = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertGreater(row['last_activity'], self.cutoff)
+        self.assertIn('Git', row['activity_reason'])
+
+    def test_state_file_inside_project_never_counts_as_source(self):
+        state = activity.ActivityStore(self.worktree / 'broom-state.json')
+        before = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        state.save()
+        after = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertEqual(before['last_activity'], after['last_activity'])
+        raw = state.filename.read_text()
+        self.assertNotIn(str(self.worktree), raw)
+        self.assertNotIn('package.json', raw)
+
+    def test_corrupt_activity_state_stops_scan(self):
+        state_path = self.base / 'state.json'
+        state_path.write_text('{"version":1,"projects":{"bad":{}}}')
+        with self.assertRaises(ValueError):
+            activity.ActivityStore(state_path)
+
+    def test_cli_partial_cleanup_keeps_recent_install_and_reports_only_old_output(self):
+        expected, _ = self.native_fixture()
+        os.utime(self.worktree / 'node_modules', None)
+        result = subprocess.run(
+            [sys.executable, str(Path(cleanup.__file__).resolve()), '--root', str(self.base),
+             '--artifact', 'rust', '--artifact', 'node_modules', '--apply', '--json',
+             '--state-file', str(self.base / 'state.json')],
+            capture_output=True, text=True, check=True, env={**os.environ, 'TMPDIR': str(self.base)},
+        )
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report['summary']['by_artifact']), {'rust'})
+        self.assertEqual(report['projects'][0]['removed'], expected['rust'])
+        self.assertTrue((self.worktree / 'node_modules').exists())
+
+    def test_open_process_is_reported_on_each_artifact(self):
+        with patch.object(sys, 'argv', ['cleanup.py', '--root', str(self.base), '--json']), \
+                patch.object(cleanup, 'open_paths', return_value=[self.worktree / 'package.json']), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(cleanup.main())
+        report = json.loads(output.getvalue())
+        self.assertEqual(report['projects'][0]['status'], 'open in a process')
+        self.assertFalse(report['projects'][0]['artifacts'][0]['eligible'])
+        self.assertEqual(report['summary']['freeable_bytes_estimate'], 0)
+
+    def test_no_op_git_reset_does_not_count_as_activity(self):
+        state = activity.ActivityStore(self.base / 'state.json')
+        before = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.run_git(self.worktree, 'reset', '--mixed', 'HEAD')
+        after = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        self.assertEqual(before['last_activity'], after['last_activity'])
+
+    def test_changing_exclusions_does_not_look_like_source_deletion(self):
+        folder = self.worktree / 'excluded'
+        folder.mkdir()
+        (folder / 'draft.ts').write_text('// old source')
+        self.age()
+        state = activity.ActivityStore(self.base / 'state.json')
+        before = cleanup.inspect(self.worktree, self.cutoff, state=state)
+        after = cleanup.inspect(self.worktree, self.cutoff, exclusions=[folder], state=state)
+        self.assertEqual(before['last_activity'], after['last_activity'])
 
 
 if __name__ == '__main__':
