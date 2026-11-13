@@ -86,6 +86,8 @@ web = true
 dotnet = false
 swift = false
 cmake = false
+pnpm = false
+terraform = false
 ```
 
 Each category inherits the existing project and worktree idle policies, including directory overrides. A recent source edit or meaningful Git activity protects the entire project. A recent install or build protects only the corresponding artifact directory. Retention and artifact selection changes take effect on the next scheduled run without reinstalling the job.
@@ -102,8 +104,26 @@ Each category inherits the existing project and worktree idle policies, includin
 | `dotnet` | `bin` and `obj` beside a `.csproj`, `.fsproj`, or `.vbproj` | `dotnet build` |
 | `swift` | `.build` beside `Package.swift` | `swift build` |
 | `cmake` | `build` beside `CMakeLists.txt`, containing `CMakeCache.txt` | Reconfigure and rebuild with CMake |
+| `pnpm` | `.pnpm-store` beside `package.json` and `pnpm-lock.yaml`. Deletes stale worktree-local stores; otherwise prunes unused packages | `pnpm install` downloads missing packages |
+| `terraform` | Only `.terraform/providers` beside a directory containing `.tf` or `.tf.json` configuration | `terraform init` or `tofu init` |
 
 Framework caches require the corresponding package dependency or config file. Generic `dist` requires an adjacent package manifest with a recognized build command and an explicit Git ignore match. A directory name alone does not qualify.
+
+The pnpm rule removes the entire local `.pnpm-store` when its linked worktree passes the project idle check and its cached package files are old enough. Regular projects, recent worktrees, and recently populated stores instead run `pnpm --store-dir <project>/.pnpm-store store prune`. Native pruning can run regardless of source recency, but open processes, exclusions, tracked files, and disabled policies still prevent cleanup. Pruning leaves referenced packages available. The store index, registry, and directory timestamps do not establish activity, so pruning cannot extend retention by changing its own metadata.
+
+Broom falls back to pruning if the store contains a virtual store under `links`, has another existing project registered under `projects`, or has an unrecognized layout. Full deletion needs no pnpm executable and can remove older store versions. Native pruning requires the installed pnpm to report the matching store version. Missing pnpm, incompatible versions, multiple store versions, and symlinked storage fail without pruning. Commands run from a temporary directory so the project's package manager pin, hooks, and configuration do not control the command. Preflight checks repeat the selected action before cleanup.
+
+Global stores stay outside this rule. pnpm normally shares a store by default, usually `~/Library/pnpm/store` on macOS. It uses one selected store per install. Remove project `storeDir` settings, legacy `store-dir` settings, or explicit `--store-dir` flags to stop selecting a local store. To set the shared path explicitly on macOS:
+
+```sh
+pnpm config set --global storeDir "$HOME/Library/pnpm/store"
+```
+
+A project override can still select another path. Check the selected store from the project with `pnpm store path`. Sandboxes that cannot access the shared location may still need a local store. See [pnpm's store settings](https://pnpm.io/settings/store) and [store command](https://pnpm.io/cli/store).
+
+Reports distinguish each store's `action`, either `remove` or `prune`, and its `action_reason`. `store_bytes` records the measured size. Only full deletions count toward estimated reclaimable and freed space. A completed native prune has status `pruned`, with its output under `completed_actions`; pnpm decides how much it can reclaim. The observed disk space change covers all cleanup actions. If a later action fails, the report retains earlier completed actions.
+
+Terraform and OpenTofu provider downloads use the same project and artifact retention checks as other categories. The rule preserves `.terraform` itself, its backend metadata and workspace selection, downloaded modules, `.terraform.lock.hcl`, and infrastructure state. Metadata and downloaded modules inside a recognized `.terraform` directory do not reset project activity. See [Terraform's working directory documentation](https://developer.hashicorp.com/terraform/cli/init). Symlinks within a selected providers directory are removed as links; Broom does not follow them into shared provider caches.
 
 Broom keeps any artifact containing a file tracked in the owning repository. It rechecks tracked files and the selected artifact paths before deletion. Excluding a path inside an artifact protects that entire artifact. Symlinked roots stay untouched. Nested output trees count once, so `.next/standalone/node_modules` belongs to the `.next` artifact rather than a second cleanup selection. Disabled artifact trees retain their nested dependencies too. Their timestamps do not affect unrelated artifact categories.
 

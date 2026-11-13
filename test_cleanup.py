@@ -353,7 +353,7 @@ class CleanupTests(unittest.TestCase):
         default = cleanup.inspect(self.worktree)
         self.assertEqual({r['type'] for r in default['artifacts']}, {'node_modules'})
         row = cleanup.inspect(self.worktree, enabled=catalog.TYPES)
-        self.assertEqual({r['type'] for r in row['artifacts']}, set(catalog.TYPES))
+        self.assertEqual({r['type'] for r in row['artifacts']}, set(expected) | {'node_modules'})
         summary = cleanup.space_summary([{**row, 'status': 'candidate'}], False)
         self.assertEqual(sum(r['freeable_bytes_estimate'] for r in summary['by_artifact'].values()), row['estimated_bytes'])
         with patch.object(cleanup, 'open_paths', return_value=[]):
@@ -678,6 +678,263 @@ class CleanupTests(unittest.TestCase):
         before = cleanup.inspect(self.worktree, self.cutoff, state=state)
         after = cleanup.inspect(self.worktree, self.cutoff, exclusions=[folder], state=state)
         self.assertEqual(before['last_activity'], after['last_activity'])
+
+
+    def store_fixture(self):
+        (self.worktree / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0')
+        store = self.worktree / '.pnpm-store'
+        (store / 'v11/files').mkdir(parents=True)
+        (store / 'v11/files/unused').write_text('cache')
+        self.age()
+        return store
+
+    def fake_pnpm(self):
+        executable = self.base / 'pnpm-test'
+        executable.write_text('#!' + sys.executable + '\n' + r"""
+import json, pathlib, sys
+store = pathlib.Path(sys.argv[sys.argv.index('--store-dir') + 1])
+with (store.parent.parent / 'pnpm-calls.jsonl').open('a') as log:
+    log.write(json.dumps({'args': sys.argv[1:], 'cwd': str(pathlib.Path.cwd())}) + '\n')
+if sys.argv[-1] == 'path':
+    print(store / 'v11')
+else:
+    (store / 'v11/files/unused').unlink()
+    print('Pruned unused package')
+""")
+        executable.chmod(0o755)
+        return executable
+
+    def test_pnpm_preview_selects_entire_stale_worktree_store_for_removal(self):
+        store = self.store_fixture()
+        with patch.object(cleanup, 'prune_pnpm_store') as prune:
+            row = cleanup.inspect(self.worktree, self.cutoff, enabled=['pnpm'])
+        prune.assert_not_called()
+        self.assertGreater(row['estimated_bytes'], 0)
+        artifact = row['artifacts'][0]
+        self.assertEqual(artifact['path'], str(store))
+        self.assertEqual(artifact['action'], 'remove')
+        self.assertGreater(artifact['store_bytes'], 0)
+        self.assertTrue(artifact['eligible'])
+
+    def test_pnpm_prune_uses_explicit_store_and_isolated_cwd(self):
+        store = self.store_fixture()
+        (self.worktree / 'package.json').touch()
+        executable = self.fake_pnpm()
+        actions = []
+        with patch.object(cleanup.shutil, 'which', return_value=str(executable)), \
+                patch.object(cleanup, 'open_paths', return_value=[]):
+            removed = cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['pnpm'], completed=actions)
+        self.assertEqual(removed, [])
+        self.assertTrue(store.exists())
+        self.assertFalse((store / 'v11/files/unused').exists())
+        self.assertEqual(actions[0]['status'], 'pruned')
+        calls = [json.loads(line) for line in (self.base / 'pnpm-calls.jsonl').read_text().splitlines()]
+        self.assertEqual([c['args'] for c in calls], [
+            ['--store-dir', str(store), 'store', 'path'],
+            ['--store-dir', str(store), 'store', 'prune']])
+        self.assertTrue(all(c['cwd'] != str(self.worktree) for c in calls))
+
+    def test_pnpm_incompatible_version_and_missing_executable_leave_store_intact(self):
+        store = self.store_fixture()
+        with patch.object(cleanup.shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(RuntimeError, 'unavailable'):
+                cleanup.prune_pnpm_store(store)
+        (store / 'v11').rename(store / 'v10')
+        with patch.object(cleanup.shutil, 'which', return_value=str(self.fake_pnpm())):
+            with self.assertRaisesRegex(RuntimeError, 'different store version'):
+                cleanup.prune_pnpm_store(store)
+        self.assertTrue((store / 'v10/files/unused').exists())
+        calls = (self.base / 'pnpm-calls.jsonl').read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+
+    def test_pnpm_open_recent_excluded_and_tracked_stores_are_not_pruned(self):
+        store = self.store_fixture()
+        with patch.object(cleanup, 'prune_pnpm_store') as prune:
+            with patch.object(cleanup, 'open_paths', return_value=[store / 'v11/files/unused']):
+                with self.assertRaisesRegex(RuntimeError, 'became active'):
+                    cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['pnpm'])
+            row = cleanup.inspect(self.worktree, self.cutoff, exclusions=[store / 'v11/files'], enabled=['pnpm'])
+            self.assertEqual(row['artifacts'], [])
+            (store / 'v11/files/unused').touch()
+            row = cleanup.inspect(self.worktree, self.cutoff, enabled=['pnpm'])
+            self.assertTrue(row['artifacts'][0]['eligible'])
+            self.assertEqual(row['artifacts'][0]['action'], 'prune')
+            self.run_git(self.worktree, 'add', '-f', str(store / 'v11/files/unused'))
+            self.age()
+            row = cleanup.inspect(self.worktree, self.cutoff, enabled=['pnpm'])
+            self.assertEqual(row['artifacts'], [])
+        prune.assert_not_called()
+
+    def test_pnpm_symlinked_storage_is_rejected(self):
+        store = self.store_fixture()
+        (store / 'v11/files').rename(store / 'v11/elsewhere')
+        (store / 'v11/files').symlink_to(store / 'v11/elsewhere', target_is_directory=True)
+        with patch.object(cleanup.shutil, 'which', return_value='/fake/pnpm'):
+            with self.assertRaisesRegex(RuntimeError, 'symlinked storage'):
+                cleanup.prune_pnpm_store(store)
+
+    def test_pnpm_apply_reports_pruned_not_removed_and_no_full_store_savings(self):
+        store = self.store_fixture()
+        (self.worktree / 'package.json').touch()
+        filename = self.write_config(extra='[artifacts]\nnode_modules = false\npnpm = true')
+        with patch.object(sys, 'argv', ['cleanup.py', '--config', str(filename), '--apply', '--json']), \
+                patch.object(cleanup.shutil, 'which', return_value=str(self.fake_pnpm())), \
+                patch.object(cleanup, 'open_paths', return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(cleanup.main())
+        report = json.loads(out.getvalue())
+        row = next(r for r in report['projects'] if r['path'] == str(self.worktree))
+        self.assertEqual(row['status'], 'cleaned')
+        self.assertEqual(row['artifacts'][0]['status'], 'pruned')
+        self.assertEqual(row['removed'], [])
+        self.assertEqual(report['summary']['freed_bytes_estimate'], 0)
+        self.assertEqual(report['summary']['pruned_stores'], 1)
+        self.assertTrue(store.exists())
+
+    def test_failed_prune_reports_preceding_deletions_without_full_store_savings(self):
+        store = self.store_fixture()
+        nested = self.worktree / 'packages/app'
+        nested.mkdir(parents=True)
+        (nested / 'package.json').write_text('{}')
+        (nested / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0')
+        store.rename(nested / '.pnpm-store')
+        store = nested / '.pnpm-store'
+        self.age()
+        (store / 'v11/files/unused').touch()
+        filename = self.write_config(extra='[artifacts]\npnpm = true')
+        with patch.object(sys, 'argv', ['cleanup.py', '--config', str(filename), '--apply', '--json']), \
+                patch.object(cleanup, 'prune_pnpm_store', side_effect=RuntimeError('prune failed')), \
+                patch.object(cleanup, 'open_paths', return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(cleanup.main())
+        report = json.loads(out.getvalue())
+        row = next(r for r in report['projects'] if r['path'] == str(self.worktree))
+        self.assertEqual(row['status'], 'cleanup failed')
+        self.assertFalse((self.worktree / 'node_modules').exists())
+        self.assertTrue(store.exists())
+        self.assertGreater(report['summary']['freed_bytes_estimate'], 0)
+        self.assertEqual(report['summary']['pruned_stores'], 0)
+        self.assertEqual(report['summary']['by_artifact']['pnpm']['freed_bytes_estimate'], 0)
+
+    def test_pnpm_full_removal_needs_no_pnpm_and_leaves_code(self):
+        store = self.store_fixture()
+        with patch.object(cleanup.shutil, 'which', return_value=None), \
+                patch.object(cleanup, 'open_paths', return_value=[]):
+            removed = cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['pnpm'])
+        self.assertEqual(removed, [str(store)])
+        self.assertFalse(store.exists())
+        self.assertTrue((self.worktree / 'pnpm-lock.yaml').exists())
+        self.assertTrue((self.worktree / 'node_modules').exists())
+
+    def test_pnpm_recent_source_prunes_store_without_deleting_other_artifacts(self):
+        store = self.store_fixture()
+        (self.worktree / 'package.json').touch()
+        row = cleanup.inspect(self.worktree, self.cutoff, enabled=['pnpm', 'node_modules'])
+        by_type = {a['type']: a for a in row['artifacts']}
+        self.assertEqual(by_type['pnpm']['action'], 'prune')
+        self.assertTrue(by_type['pnpm']['eligible'])
+        self.assertFalse(by_type['node_modules']['eligible'])
+        self.assertEqual(row['estimated_bytes'], 0)
+
+    def test_pnpm_regular_project_store_is_pruned_even_when_old(self):
+        store = self.store_fixture()
+        store.rename(self.repo / '.pnpm-store')
+        (self.worktree / 'pnpm-lock.yaml').rename(self.repo / 'pnpm-lock.yaml')
+        self.age()
+        row = cleanup.inspect(self.repo, self.cutoff, enabled=['pnpm'])
+        self.assertEqual(row['artifacts'][0]['action'], 'prune')
+
+    def test_pnpm_shared_virtual_store_and_external_registry_prevent_removal(self):
+        store = self.store_fixture()
+        links = store / 'v11/links'
+        links.mkdir()
+        self.age()
+        row = cleanup.inspect(self.worktree, self.cutoff, enabled=['pnpm'])
+        self.assertEqual(row['artifacts'][0]['action'], 'prune')
+        links.rmdir()
+        registry = store / 'v11/projects'
+        registry.mkdir()
+        (registry / 'other').symlink_to(self.repo, target_is_directory=True)
+        self.age()
+        row = cleanup.inspect(self.worktree, self.cutoff, enabled=['pnpm'])
+        self.assertEqual(row['artifacts'][0]['action'], 'prune')
+        self.assertIn('another project', row['artifacts'][0]['action_reason'])
+
+    def test_pnpm_preflight_rejects_changed_action(self):
+        store = self.store_fixture()
+        (self.worktree / 'package.json').touch()
+        with patch.object(cleanup, 'open_paths', return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, 'action changed'):
+                cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['pnpm'],
+                                         expected_actions={str(store): 'remove'})
+        self.assertTrue(store.exists())
+
+    def test_pnpm_pruning_bookkeeping_does_not_extend_store_retention(self):
+        store = self.store_fixture()
+        (self.worktree / 'package.json').touch()
+        with patch.object(cleanup.shutil, 'which', return_value=str(self.fake_pnpm())), \
+                patch.object(cleanup, 'open_paths', return_value=[]):
+            cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['pnpm'])
+        (store / 'v11/index.db').write_text('prune updated index')
+        source = self.worktree / 'package.json'
+        os.utime(source, (self.old, self.old))
+        row = cleanup.inspect(self.worktree, self.cutoff, enabled=['pnpm'])
+        self.assertEqual(row['artifacts'][0]['action'], 'remove')
+
+    def terraform_fixture(self):
+        parent = self.worktree / 'infrastructure'
+        parent.mkdir()
+        (parent / 'main.tf').write_text('terraform {}')
+        (parent / '.terraform.lock.hcl').write_text('locked providers')
+        (parent / 'terraform.tfstate').write_text('infrastructure state')
+        data = parent / '.terraform'
+        (data / 'providers/pkg').mkdir(parents=True)
+        (data / 'providers/pkg/provider').write_text('provider binary')
+        (data / 'modules').mkdir()
+        (data / 'modules/modules.json').write_text('{}')
+        (data / 'terraform.tfstate').write_text('backend metadata')
+        (data / 'environment').write_text('production')
+        self.age()
+        return parent, data
+
+    def test_terraform_cleans_only_providers_preserving_metadata_and_state(self):
+        parent, data = self.terraform_fixture()
+        with patch.object(cleanup, 'open_paths', return_value=[]):
+            removed = cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['terraform'])
+        self.assertEqual(removed, [str(data / 'providers')])
+        self.assertFalse((data / 'providers').exists())
+        for p in [parent / '.terraform.lock.hcl', parent / 'terraform.tfstate',
+                  data / 'terraform.tfstate', data / 'environment', data / 'modules/modules.json']:
+            self.assertTrue(p.is_file(), p)
+
+    def test_terraform_provider_symlink_does_not_delete_shared_cache(self):
+        parent, data = self.terraform_fixture()
+        shared = self.base / 'shared-provider'
+        shared.write_text('shared binary')
+        (data / 'providers/shared').symlink_to(shared)
+        self.age()
+        with patch.object(cleanup, 'open_paths', return_value=[]):
+            cleanup.remove_artifacts(self.worktree, self.cutoff, enabled=['terraform'])
+        self.assertTrue(shared.is_file())
+
+    def test_terraform_requires_configuration_and_does_not_discover_module_dependencies(self):
+        parent, data = self.terraform_fixture()
+        dependency = data / 'modules/downloaded'
+        dependency.mkdir()
+        (dependency / 'main.tf').write_text('downloaded module')
+        self.assertNotIn(dependency, cleanup.discover([self.base]))
+        self.assertEqual(catalog.classify(parent, 'providers', []), None)
+        (parent / 'main.tf').unlink()
+        self.assertEqual(cleanup.inspect(self.worktree, enabled=['terraform'])['artifacts'], [])
+
+    def test_terraform_recent_provider_does_not_protect_other_artifacts(self):
+        _, data = self.terraform_fixture()
+        (data / 'providers/pkg/provider').touch()
+        row = cleanup.inspect(self.worktree, self.cutoff, enabled=['terraform', 'node_modules'])
+        self.assertLess(row['last_activity'], self.cutoff)
+        by_type = {a['type']: a for a in row['artifacts']}
+        self.assertFalse(by_type['terraform']['eligible'])
+        self.assertTrue(by_type['node_modules']['eligible'])
 
 
 if __name__ == '__main__':

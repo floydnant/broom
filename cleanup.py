@@ -50,7 +50,7 @@ def discover(roots, exclusions=()):
                 found.add(path.resolve())
             dirs[:] = [d for d in dirs if d not in {
                 '.git', 'node_modules', 'target', 'vendor', '.next', '.nuxt',
-                'dist', 'build', '.cache', '.turbo', '.venv',
+                'dist', 'build', '.cache', '.turbo', '.venv', '.pnpm-store', '.terraform',
             } and not (path / d).is_symlink() and catalog.classify(path, d, files) is None]
     return sorted(found)
 
@@ -131,6 +131,30 @@ def git_activity(path, admin):
     return identity, timestamp, 'Git checkout or commit recorded in HEAD reflog' if timestamp else None
 
 
+def pnpm_removal_protection(target, project):
+    """Keep shared stores and virtual stores out of whole-directory deletion."""
+    versions = list(target.iterdir())
+    if not versions or any(not p.name.startswith('v') or not p.name[1:].isdigit()
+                           or not p.is_dir() or p.is_symlink() for p in versions):
+        return 'unrecognized store layout; prune only'
+    for version in versions:
+        if not (version / 'files').is_dir() or (version / 'files').is_symlink():
+            return 'unrecognized store content directory; prune only'
+        if (version / 'links').exists() or (version / 'links').is_symlink():
+            return 'contains a shared virtual store; prune only'
+        registry = version / 'projects'
+        if registry.is_symlink():
+            return 'symlinked project registry; prune only'
+        if registry.exists():
+            for entry in registry.iterdir():
+                if not entry.is_symlink():
+                    return 'unrecognized project registry; prune only'
+                owner = entry.resolve()
+                if owner.exists() and owner != project and project not in owner.parents:
+                    return 'store is registered to another project; prune only'
+    return None
+
+
 def inspect(path, cutoff=None, exclusions=(), enabled=None, state=None, observed_at=None):
     """Keep source activity separate from each selected artifact's activity."""
     kind, admin = project_kind(path)
@@ -163,6 +187,11 @@ def inspect(path, cutoff=None, exclusions=(), enabled=None, state=None, observed
 
     for root, dirs, files in walk(path):
         here = Path(root)
+        # Terraform metadata and downloaded modules are not source activity.
+        # Enter only providers, which has its own artifact retention check.
+        if here.name == '.terraform' and catalog.classify(here, 'providers', files) == 'terraform':
+            files = []
+            dirs[:] = [name for name in dirs if name == 'providers']
         if configuration.excluded(here, exclusions) or (here != path and '.git' in files + dirs):
             excluded_trees.append(here)
             dirs[:] = []
@@ -198,6 +227,7 @@ def inspect(path, cutoff=None, exclusions=(), enabled=None, state=None, observed
                     if artifact_type not in enabled:
                         continue
                     outputs.append({'path': str(child), 'type': artifact_type, 'selected': True,
+                                    'action': 'prune' if artifact_type == 'pnpm' else 'remove',
                                     'eligible': False, 'status': 'recent source', 'estimated_bytes': None})
                 else:
                     kept.append(name)
@@ -220,16 +250,26 @@ def inspect(path, cutoff=None, exclusions=(), enabled=None, state=None, observed
            'activity_path': recent_path,
            'node_modules': [r['path'] for r in outputs if r['type'] == 'node_modules'],
            'artifacts': outputs, 'protected_artifacts': protected, 'estimated_bytes': None}
-    if cutoff is not None and latest >= cutoff:
+    project_recent = cutoff is not None and latest >= cutoff
+    if project_recent and not any(a['type'] == 'pnpm' for a in outputs):
         return row
     size, seen = 0, set()
     for artifact in outputs:
+        if project_recent and artifact['type'] != 'pnpm':
+            continue
         artifact_latest, artifact_path, blocks, inodes = 0.0, None, 0, set()
         entries = []
         for root, dirs, files in walk(Path(artifact['path'])):
             for entry in [Path(root)] + [Path(root) / n for n in files + dirs]:
                 stat = entry.lstat()
-                if stat.st_mtime > artifact_latest:
+                relative = entry.relative_to(artifact['path'])
+                # Pruning updates store directories and the index. Only cached
+                # package files establish store activity, so our own pruning
+                # cannot keep an otherwise stale store forever.
+                store_content = (len(relative.parts) >= 3 and relative.parts[1] == 'files'
+                                 and entry.is_file() and not entry.is_symlink())
+                counts_as_activity = artifact['type'] != 'pnpm' or store_content
+                if counts_as_activity and stat.st_mtime > artifact_latest:
                     artifact_latest, artifact_path = stat.st_mtime, str(entry.relative_to(path))
                 inode = (stat.st_dev, stat.st_ino)
                 if inode not in inodes:
@@ -239,8 +279,22 @@ def inspect(path, cutoff=None, exclusions=(), enabled=None, state=None, observed
         artifact.update(last_activity=artifact_latest, activity_path=artifact_path,
                         estimated_bytes=blocks,
                         eligible=cutoff is None or artifact_latest < cutoff)
+        if artifact['type'] == 'pnpm':
+            artifact['store_bytes'] = blocks
+            protection = pnpm_removal_protection(Path(artifact['path']), path)
+            remove_store = (kind == 'worktree' and cutoff is not None and not project_recent
+                            and artifact_latest < cutoff and protection is None)
+            artifact['action'] = 'remove' if remove_store else 'prune'
+            artifact['eligible'] = True
+            artifact['action_reason'] = ('stale worktree and store' if remove_store else
+                                         protection or 'recent worktree/store or regular project; prune only')
+            if not remove_store:
+                # pnpm decides how much unreferenced content can be reclaimed.
+                artifact['estimated_bytes'] = 0
         artifact['status'] = 'candidate' if artifact['eligible'] else 'recent artifact'
         if artifact['eligible']:
+            if artifact['action'] == 'prune':
+                continue
             accounted = 0
             for inode, allocation in entries:
                 if inode not in seen:
@@ -278,8 +332,8 @@ def available_bytes(path):
 
 
 def space_summary(rows, apply):
-    eligible = [r for r in rows if r['status'] in ('candidate', 'removed', 'cleanup failed')]
-    removed = [r for r in rows if r['status'] == 'removed']
+    eligible = [r for r in rows if r['status'] in ('candidate', 'removed', 'cleaned', 'cleanup failed')]
+    removed = [r for r in rows if r['status'] in ('removed', 'cleaned')]
     attempts = [r for r in rows if 'available_space_change_bytes' in r]
     measured = all(r['available_space_change_bytes'] is not None for r in attempts)
     categories = {}
@@ -291,13 +345,17 @@ def space_summary(rows, apply):
                                                            'freed_bytes_estimate': 0})
             item['directories'] += 1
             item['freeable_bytes_estimate'] += artifact.get('estimated_bytes') or 0
-            if row['status'] == 'removed':
+            if artifact.get('status') == 'removed' or row['status'] == 'removed':
                 item['freed_bytes_estimate'] += artifact.get('estimated_bytes') or 0
     return {
         'eligible_projects': len(eligible),
         'freeable_bytes_estimate': sum(r['estimated_bytes'] for r in eligible),
         'removed_projects': len(removed),
-        'freed_bytes_estimate': sum(r['estimated_bytes'] for r in removed),
+        'freed_bytes_estimate': sum(
+            sum(a.get('freed_bytes_estimate') or 0 for a in r['completed_actions'])
+            if 'completed_actions' in r else r['estimated_bytes'] if r['status'] == 'removed' else 0
+            for r in eligible),
+        'pruned_stores': sum(a.get('status') == 'pruned' for r in rows for a in r.get('artifacts', [])),
         'by_artifact': categories,
         'available_space_change_bytes': (
             sum(r['available_space_change_bytes'] for r in attempts)
@@ -305,17 +363,49 @@ def space_summary(rows, apply):
     }
 
 
-def remove_artifacts(path, cutoff, exclusions=(), expected_kind=None, enabled=None, expected_paths=None, state=None):
+def prune_pnpm_store(target):
+    """Let pnpm remove unreferenced content, without loading project settings."""
+    executable = shutil.which('pnpm')
+    if executable is None:
+        raise RuntimeError('pnpm is unavailable; store was not changed')
+    children = list(target.iterdir())
+    versions = [p for p in children if p.name.startswith('v') and p.name[1:].isdigit()]
+    if len(versions) != 1 or any(p.is_symlink() for p in children):
+        raise RuntimeError('pnpm store must contain one non-symlinked version directory')
+    if not (versions[0] / 'files').is_dir() or any(p.is_symlink() for p in versions[0].iterdir()):
+        raise RuntimeError('pnpm store layout is missing or contains symlinked storage')
+    # A temporary cwd avoids project hooks, .npmrc settings, and automatic
+    # selection/download of the package manager pinned by the repository.
+    with tempfile.TemporaryDirectory(prefix='broom-pnpm-') as directory:
+        command = [executable, '--store-dir', str(target), 'store']
+        def run(*arguments):
+            result = subprocess.run(command + list(arguments), cwd=directory,
+                                    capture_output=True, text=True, timeout=600)
+            if result.returncode:
+                detail = result.stderr.strip() or result.stdout.strip() or f'exit {result.returncode}'
+                raise RuntimeError('pnpm store command failed: ' + detail[:1000])
+            return result.stdout.strip()
+        actual = Path(run('path'))
+        if not actual.is_absolute() or actual != versions[0] or actual.resolve() != actual:
+            raise RuntimeError('installed pnpm targets a different store version; store was not pruned')
+        return run('prune')
+
+
+def remove_artifacts(path, cutoff, exclusions=(), expected_kind=None, enabled=None, expected_paths=None, state=None,
+                     completed=None, expected_actions=None):
     # Repeat the full activity scan immediately before changing anything.
     current = inspect(path, cutoff, exclusions, enabled, state)
     if expected_kind is not None and current['kind'] != expected_kind:
         raise RuntimeError('project kind changed during the scan')
-    if current['last_activity'] >= cutoff or is_open(path, open_paths()):
+    if (current['last_activity'] >= cutoff and not any(
+            a['eligible'] and a['action'] == 'prune' for a in current['artifacts'])) or is_open(path, open_paths()):
         raise RuntimeError('project became active during the scan')
     removed = []
     paths = [r['path'] for r in current['artifacts'] if r['eligible']]
     if expected_paths is not None and set(paths) != set(expected_paths):
         raise RuntimeError('artifact selection changed during the scan')
+    if expected_actions is not None and {a['path']: a['action'] for a in current['artifacts'] if a['eligible']} != expected_actions:
+        raise RuntimeError('artifact action changed during the scan')
     for value in paths:
         target = Path(value)
         if (target.is_symlink() or path not in target.parents
@@ -327,6 +417,18 @@ def remove_artifacts(path, cutoff, exclusions=(), expected_kind=None, enabled=No
         _, admin = project_kind(path)
         if admin is not None and git(path, 'ls-files', '--', str(target.relative_to(path))):
             raise RuntimeError('artifact now contains tracked files')
+        artifact = next(r for r in current['artifacts'] if r['path'] == value)
+        if artifact['action'] == 'prune':
+            output = prune_pnpm_store(target)
+            if completed is not None:
+                completed.append({'path': value, 'status': 'pruned', 'output': output,
+                                  'freed_bytes_estimate': None})
+            # Pruning leaves the store itself in place.
+            continue
+        if current['last_activity'] >= cutoff:
+            raise RuntimeError('project became active during the scan')
+        if artifact['type'] == 'pnpm' and pnpm_removal_protection(target, path):
+            raise RuntimeError('pnpm store became shared during the scan')
         staged = target.with_name('.worktree-cleanup-' + uuid.uuid4().hex)
         target.rename(staged)
         try:
@@ -336,6 +438,9 @@ def remove_artifacts(path, cutoff, exclusions=(), expected_kind=None, enabled=No
                 staged.rename(target)
             raise
         removed.append(value)
+        if completed is not None:
+            completed.append({'path': value, 'status': 'removed',
+                              'freed_bytes_estimate': artifact['estimated_bytes']})
     return removed
 
 
@@ -350,7 +455,7 @@ def main():
     parser.add_argument('--root', action='append', type=Path,
                         help='discovery root, repeatable; replaces default roots')
     parser.add_argument('--days', type=float, help='override both retention thresholds for this run')
-    parser.add_argument('--apply', action='store_true', help='delete the listed dependency directories')
+    parser.add_argument('--apply', action='store_true', help='remove selected artifacts and prune selected pnpm stores')
     parser.add_argument('--scheduled', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--json', action='store_true', help='emit a machine-readable report')
     parser.add_argument('--artifact', action='append', choices=catalog.TYPES,
@@ -410,9 +515,9 @@ def main():
             row = inspect(path, cutoff, exclusions, enabled, state, now)
             row['idle_days'] = policy['idle_days']
             row['status'] = ('no artifacts' if not row['artifacts'] else
-                             'recent source activity' if row['last_activity'] >= cutoff else
                              'open in a process' if is_open(path, opened) else
-                             'candidate' if any(a['eligible'] for a in row['artifacts']) else 'recent artifacts')
+                             'candidate' if any(a['eligible'] for a in row['artifacts']) else
+                             'recent source activity' if row['last_activity'] >= cutoff else 'recent artifacts')
             if row['status'] == 'open in a process':
                 row['estimated_bytes'] = 0
                 for artifact in row['artifacts']:
@@ -420,12 +525,18 @@ def main():
             rows.append(row)
             if args.apply and row['status'] == 'candidate':
                 before = available_bytes(path)
+                row['completed_actions'] = []
                 try:
                     state.save()
                     row['removed'] = remove_artifacts(path, cutoff, exclusions, kind, enabled,
-                                                     [r['path'] for r in row['artifacts'] if r['eligible']], state)
-                    row['status'] = 'removed'
+                                                     [r['path'] for r in row['artifacts'] if r['eligible']], state,
+                                                     row['completed_actions'],
+                                                     {a['path']: a['action'] for a in row['artifacts'] if a['eligible']})
+                    row['status'] = ('cleaned' if any(a['status'] == 'pruned' for a in row['completed_actions'])
+                                     else 'removed')
                 finally:
+                    for action in row['completed_actions']:
+                        next(a for a in row['artifacts'] if a['path'] == action['path']).update(action)
                     after = available_bytes(path)
                     row['available_space_change_bytes'] = (
                         after - before if before is not None and after is not None else None)
@@ -457,6 +568,9 @@ def main():
             for artifact in row.get('artifacts', []):
                 label = 'removed' if artifact['path'] in row.get('removed', []) else artifact['status']
                 print(f"  {artifact['type']}: {label}, {artifact['path']}")
+                if artifact['type'] == 'pnpm' and 'store_bytes' in artifact:
+                    print(f"    Store size: {artifact['store_bytes'] / 2**30:.2f} GiB; "
+                          f"{artifact['action']}: {artifact['action_reason']}")
         for error in errors:
             print(f"Skipped {error['path']}: {error['error']}", file=sys.stderr)
         print(f"\nFreeable space, estimated: {summary['freeable_bytes_estimate'] / 2**30:.2f} GiB "

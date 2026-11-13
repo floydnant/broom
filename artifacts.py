@@ -2,10 +2,10 @@
 import json
 import re
 
-TYPES = ('node_modules', 'rust', 'gradle', 'flutter', 'ios_build', 'cocoapods', 'web', 'dotnet', 'swift', 'cmake')
+TYPES = ('node_modules', 'rust', 'gradle', 'flutter', 'ios_build', 'cocoapods', 'web', 'dotnet', 'swift', 'cmake', 'pnpm', 'terraform')
 NAMES = {'node_modules', 'target', 'build', '.gradle', '.cxx', '.dart_tool',
          'DerivedData', 'Pods', '.next', '.nuxt', '.output', '.turbo', '.expo',
-         '.parcel-cache', 'cache', 'dist', 'bin', 'obj', '.build'}
+         '.parcel-cache', 'cache', 'dist', 'bin', 'obj', '.build', '.pnpm-store', 'providers'}
 MARKERS = {'package.json', 'Cargo.toml', 'pubspec.yaml', 'Podfile',
            'build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts',
            'Package.swift', 'CMakeLists.txt'}
@@ -13,7 +13,7 @@ DOTNET_SUFFIXES = ('.csproj', '.fsproj', '.vbproj')
 
 
 def is_project(files, dirs):
-    return bool(MARKERS.intersection(files)) or any(
+    return bool(MARKERS.intersection(files)) or any(n.endswith(('.tf', '.tf.json')) for n in files) or any(
         n.endswith(DOTNET_SUFFIXES) for n in files
     ) or any(n.endswith('.xcodeproj') for n in dirs)
 
@@ -28,6 +28,13 @@ def classify(parent, name, files):
                                      'settings.gradle', 'settings.gradle.kts'}))
     if name == 'node_modules':
         return 'node_modules'
+    if name == '.pnpm-store' and 'package.json' in files and (parent / 'pnpm-lock.yaml').is_file():
+        return 'pnpm'
+    if name == 'providers' and parent.name == '.terraform' and any(
+        p.is_file() and not p.is_symlink() and p.name.endswith(('.tf', '.tf.json'))
+        for p in parent.parent.iterdir()
+    ):
+        return 'terraform'
     if name == 'target' and 'Cargo.toml' in files:
         return 'rust'
     if name == '.build' and 'Package.swift' in files:

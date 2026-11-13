@@ -47,6 +47,8 @@ web = false
 dotnet = false
 swift = false
 cmake = false
+pnpm = false
+terraform = false
 
 [activity]
 # Private source inventories. Keep this outside your project directories.
